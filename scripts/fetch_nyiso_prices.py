@@ -1,11 +1,11 @@
 """Fetch 90 days of NYISO real-time + day-ahead LBMP prices.
 
-Real source: NYISO public CSV archive — no API key.
+Real source: NYISO public CSV archive — no API key required.
   RT (5-min):   https://mis.nyiso.com/public/csv/realtime/YYYYMMDDrealtime_zone.csv
   DAM (hourly): https://mis.nyiso.com/public/csv/damlbmp/YYYYMMDDdamlbmp_zone.csv
 
-If the server is unreachable or --synthetic is passed, generates a plausible
-15-min price curve with realistic daily/weekly/volatility shape.
+Raises FetchError if the server is unreachable or any day returns a non-200
+status — no synthetic fallback.
 
 Output:
   data/nyiso/<zone>_15min.parquet     — (timestamp, lbmp, split)
@@ -34,7 +34,7 @@ from aerogrid.config import (
     NYISO_TRAIN_START,
     NYISO_ZONE,
 )
-from scripts._common import http_get, write_manifest
+from scripts._common import FetchError, http_get, write_manifest
 
 NYISO_RT_URL = "https://mis.nyiso.com/public/csv/realtime/{ymd}realtime_zone.csv"
 NYISO_DAM_URL = "https://mis.nyiso.com/public/csv/damlbmp/{ymd}damlbmp_zone.csv"
@@ -44,8 +44,8 @@ NYISO_DAM_URL = "https://mis.nyiso.com/public/csv/damlbmp/{ymd}damlbmp_zone.csv"
 # Real fetch                                                                  #
 # --------------------------------------------------------------------------- #
 def _try_fetch_real(zone: str, start: datetime, end: datetime
-                    ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """Download per-day CSVs and concatenate. Returns (rt, dam) or None."""
+                    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download per-day CSVs and concatenate. Raises FetchError on any failure."""
     rt_frames: list[pd.DataFrame] = []
     dam_frames: list[pd.DataFrame] = []
     day = start
@@ -54,12 +54,10 @@ def _try_fetch_real(zone: str, start: datetime, end: datetime
         try:
             r_rt = http_get(NYISO_RT_URL.format(ymd=ymd), timeout=15)
             r_dam = http_get(NYISO_DAM_URL.format(ymd=ymd), timeout=15)
-        except Exception as e:  # noqa: BLE001
-            print(f"  {ymd}: network error {e!r}")
-            return None
+        except Exception as e:
+            raise FetchError(f"NYISO network error on {ymd}: {e}") from e
         if r_rt.status_code != 200 or r_dam.status_code != 200:
-            print(f"  {ymd}: HTTP {r_rt.status_code}/{r_dam.status_code}")
-            return None
+            raise FetchError(f"NYISO HTTP {r_rt.status_code}/{r_dam.status_code} on {ymd}")
         rt_frames.append(pd.read_csv(io.StringIO(r_rt.text)))
         dam_frames.append(pd.read_csv(io.StringIO(r_dam.text)))
         day += timedelta(days=1)
@@ -77,58 +75,6 @@ def _try_fetch_real(zone: str, start: datetime, end: datetime
         return df[["timestamp", "lbmp"]].sort_values("timestamp").reset_index(drop=True)
 
     return _filter(rt), _filter(dam)
-
-
-# --------------------------------------------------------------------------- #
-# Synthetic                                                                   #
-# --------------------------------------------------------------------------- #
-_RNG = np.random.default_rng(20241216)
-
-
-def _synthesize(start: datetime, end: datetime) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Realistic NYC-ish price curve at 5-min and hourly."""
-    n_min = int((end - start).total_seconds() // 60)
-    t_5min = pd.date_range(start, periods=n_min // 5, freq="5min", tz="UTC")
-    t_hour = pd.date_range(start, periods=n_min // 60, freq="h", tz="UTC")
-
-    # local ET hour-of-day (NYISO prices are set on ET clock).
-    local = t_5min.tz_convert("US/Eastern")
-    hod = np.asarray(local.hour + local.minute / 60.0, dtype=float)
-    dow = np.asarray(local.dayofweek)
-
-    # Double-peak daily shape: morning (~08) + evening (~18).
-    shape = (
-        25
-        + 12 * np.sin(2 * np.pi * (hod - 7) / 24)
-        + 18 * np.exp(-((hod - 8) ** 2) / 5)
-        + 25 * np.exp(-((hod - 18) ** 2) / 6)
-    )
-    weekend_mult = np.where(dow >= 5, 0.75, 1.0)
-    trend = 2.0 * np.sin(2 * np.pi * np.arange(len(t_5min)) / (12 * 24 * 7))  # weekly
-    # AR(1) noise + occasional spikes.
-    noise = np.zeros(len(t_5min))
-    for i in range(1, len(t_5min)):
-        noise[i] = 0.85 * noise[i - 1] + _RNG.normal(0, 3.5)
-    spikes = _RNG.choice([0, 0, 0, 0, 0, 1], size=len(t_5min)) * _RNG.uniform(
-        20, 90, size=len(t_5min)
-    )
-    lbmp_5 = (shape * weekend_mult + trend + noise + spikes).clip(min=-5)
-
-    rt = pd.DataFrame({"timestamp": t_5min, "lbmp": lbmp_5.astype(np.float32)})
-
-    # Day-ahead = smoothed 5-min aggregated to hourly, with small bias.
-    dam_lbmp = (
-        rt.set_index("timestamp")
-        .resample("1h")["lbmp"]
-        .mean()
-        .reindex(t_hour)
-        .ffill()
-        .bfill()
-        .to_numpy()
-    )
-    dam_lbmp = dam_lbmp + _RNG.normal(0, 1.5, len(t_hour))
-    dam = pd.DataFrame({"timestamp": t_hour, "lbmp": dam_lbmp.astype(np.float32)})
-    return rt, dam
 
 
 # --------------------------------------------------------------------------- #
@@ -159,26 +105,11 @@ def _tag_split(df: pd.DataFrame) -> pd.DataFrame:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--zone", default=NYISO_ZONE)
-    ap.add_argument("--synthetic", action="store_true")
     args = ap.parse_args()
 
-    rt: pd.DataFrame | None = None
-    dam: pd.DataFrame | None = None
-    source = "synthetic"
-    if not args.synthetic:
-        print(f"attempting real NYISO download for zone={args.zone}, "
-              f"{NYISO_TRAIN_START.date()}..{NYISO_TEST_END.date()}")
-        attempt = _try_fetch_real(args.zone, NYISO_TRAIN_START, NYISO_TEST_END)
-        if attempt is not None:
-            rt, dam = attempt
-            source = "real"
-        else:
-            print("falling back to synthetic")
-
-    if source == "synthetic":
-        rt, dam = _synthesize(NYISO_TRAIN_START, NYISO_TEST_END)
-
-    assert rt is not None and dam is not None
+    print(f"downloading NYISO prices for zone={args.zone}, "
+          f"{NYISO_TRAIN_START.date()}..{NYISO_TEST_END.date()}")
+    rt, dam = _try_fetch_real(args.zone, NYISO_TRAIN_START, NYISO_TEST_END)
 
     rt_15 = _tag_split(_aggregate_15min(rt))
     dam_tagged = _tag_split(dam.copy())
@@ -200,8 +131,8 @@ def main() -> int:
 
     write_manifest(
         NYISO_DIR / "MANIFEST.json",
-        source=source,
-        url_base="https://mis.nyiso.com/public/csv/" if source == "real" else None,
+        source="real",
+        url_base="https://mis.nyiso.com/public/csv/",
         windows={
             "train": (NYISO_TRAIN_START, NYISO_TRAIN_END),
             "test": (NYISO_TEST_START, NYISO_TEST_END),

@@ -66,10 +66,9 @@ Nodes:
 | NYISO DAM LBMP hourly | 90 d | same | same | `data/nyiso/nyc_dam.parquet` |
 | ENTSO-E DE-LU (optional alt) | 30 d | 20 d | 10 d | `data/entsoe/de_lu_15min.parquet` |
 
-All fetchers attempt real downloads first; if the upstream server is
-unreachable they synthesize statistically-realistic data with the same schema
-and record `source="synthetic"` in `MANIFEST.json`. The digital twin treats
-the two paths identically.
+All fetchers download real data and raise `FetchError` if the upstream server
+is unreachable — there is no synthetic fallback. Each successful run writes
+`source="real"` in `MANIFEST.json`.
 
 Note: UK-DALE (UK residential) + NYISO (US wholesale) is explicitly a
 demo artifact. Fine-tuning `GridFMPriceOracle` on ENTSO-E DE-LU so that UK
@@ -84,7 +83,7 @@ pyenv install  # reads .python-version; skipped if already installed
 # 2) env
 uv sync --extra dev
 
-# 3) data — each fetcher falls back to synthetic if upstream is unreachable
+# 3) data — fetchers require live network access; they raise on failure
 .venv/bin/python scripts/fetch_ukdale_subset.py
 .venv/bin/python scripts/fetch_ukdale_subset.py --with-16khz   # optional, ~800 MB
 .venv/bin/python scripts/fetch_nyiso_prices.py

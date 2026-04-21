@@ -1,20 +1,17 @@
-"""Optional: fetch 30 days of ENTSO-E DE-LU day-ahead prices, upsample to 15 min.
+"""Fetch 30 days of ENTSO-E DE-LU day-ahead prices, upsample to 15 min.
 
-If ENTSOE_API_KEY is in the environment (or .env), calls the ENTSO-E API via
-entsoe-py. Otherwise, writes a deterministic synthetic 15-min curve so the EU
-alt demo path is still exercisable offline. The primary demo market is NYISO
-via fetch_nyiso_prices.py; this script exists solely so a user can drive
-ChronosPriceOracle against EU data if they want.
+Requires ENTSOE_API_KEY in the environment (or .env) and the entsoe-py package
+(`uv sync --extra eu`). Raises FetchError if the key is missing or the API
+call fails — no synthetic fallback. The primary demo market is NYISO via
+fetch_nyiso_prices.py; this script is only needed for the EU alt demo path.
 """
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,20 +27,24 @@ from aerogrid.config import (
     ENTSOE_TRAIN_END,
     ENTSOE_TRAIN_START,
 )
-from scripts._common import write_manifest
+from scripts._common import FetchError, write_manifest
 
 load_dotenv(REPO_ROOT / ".env")
 
 
-def _try_fetch_real(area: str, start: datetime, end: datetime) -> pd.DataFrame | None:
+def _try_fetch_real(area: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """Fetch real ENTSO-E prices. Raises FetchError if key is missing or call fails."""
     key = os.environ.get("ENTSOE_API_KEY", "").strip()
     if not key:
-        return None
+        raise FetchError(
+            "ENTSOE_API_KEY is not set. Add it to .env or the environment and retry."
+        )
     try:
         from entsoe import EntsoePandasClient  # type: ignore
-    except ImportError:
-        print("entsoe-py not installed; `pip install entsoe-py` for EU path")
-        return None
+    except ImportError as e:
+        raise FetchError(
+            "entsoe-py is not installed. Run: uv sync --extra eu"
+        ) from e
     try:
         cli = EntsoePandasClient(api_key=key)
         s = cli.query_day_ahead_prices(
@@ -55,31 +56,10 @@ def _try_fetch_real(area: str, start: datetime, end: datetime) -> pd.DataFrame |
         df = s.reset_index()
         df.columns = ["timestamp", "price_eur_mwh"]
         return df
-    except Exception as e:  # noqa: BLE001
-        print(f"ENTSO-E API call failed: {e!r}")
-        return None
-
-
-def _synthesize(start: datetime, end: datetime) -> pd.DataFrame:
-    """EU-ish day-ahead curve: two daily peaks, weekly modulation, moderate noise."""
-    rng = np.random.default_rng(20241221)
-    n_hours = int((end - start).total_seconds() // 3600)
-    t = pd.date_range(start, periods=n_hours, freq="h", tz="UTC")
-    hod = np.asarray(t.tz_convert("Europe/Berlin").hour, dtype=float)
-    dow = np.asarray(t.tz_convert("Europe/Berlin").dayofweek)
-    shape = (
-        70
-        + 30 * np.exp(-((hod - 8) ** 2) / 4)
-        + 45 * np.exp(-((hod - 19) ** 2) / 4)
-        - 25 * np.exp(-((hod - 13) ** 2) / 6)  # midday solar dip
-    )
-    weekend_mult = np.where(dow >= 5, 0.80, 1.0)
-    noise = rng.normal(0, 6, n_hours)
-    # AR(1)
-    for i in range(1, n_hours):
-        noise[i] = 0.7 * noise[i - 1] + rng.normal(0, 6)
-    price = shape * weekend_mult + noise
-    return pd.DataFrame({"timestamp": t, "price_eur_mwh": price.astype(np.float32)})
+    except FetchError:
+        raise
+    except Exception as e:
+        raise FetchError(f"ENTSO-E API call failed: {e}") from e
 
 
 def _upsample_to_15min(df_hourly: pd.DataFrame) -> pd.DataFrame:
@@ -107,22 +87,8 @@ def _tag_split(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--synthetic", action="store_true",
-                    help="force synthetic even if API key is set")
-    args = ap.parse_args()
-
-    source = "synthetic"
-    df: pd.DataFrame | None = None
-    if not args.synthetic:
-        df = _try_fetch_real(ENTSOE_AREA, ENTSOE_TRAIN_START, ENTSOE_TEST_END)
-        if df is not None:
-            source = "real"
-            print(f"ENTSO-E: got {len(df)} hourly prices for {ENTSOE_AREA}")
-
-    if df is None:
-        df = _synthesize(ENTSOE_TRAIN_START, ENTSOE_TEST_END)
-        print(f"ENTSO-E synthetic: {len(df)} hourly prices")
+    df = _try_fetch_real(ENTSOE_AREA, ENTSOE_TRAIN_START, ENTSOE_TEST_END)
+    print(f"ENTSO-E: got {len(df)} hourly prices for {ENTSOE_AREA}")
 
     df15 = _tag_split(_upsample_to_15min(df))
     out = ENTSOE_DIR / "de_lu_15min.parquet"
@@ -135,8 +101,8 @@ def main() -> int:
 
     write_manifest(
         ENTSOE_DIR / "MANIFEST.json",
-        source=source,
-        url_base="https://web-api.tp.entsoe.eu" if source == "real" else None,
+        source="real",
+        url_base="https://web-api.tp.entsoe.eu",
         windows={
             "train": (ENTSOE_TRAIN_START, ENTSOE_TRAIN_END),
             "test": (ENTSOE_TEST_START, ENTSOE_TEST_END),

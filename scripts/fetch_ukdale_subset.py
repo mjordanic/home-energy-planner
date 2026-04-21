@@ -1,13 +1,11 @@
 """Fetch a 60-day UK-DALE House 1 subset (mains 1 Hz + per-appliance 6 s).
 
-Attempts to download from the UKERC EDC mirror. If that server is unreachable
-(which it frequently is) or --synthetic is passed, generates a realistic
-UK-DALE-shaped dataset so the rest of the pipeline can be exercised.
+Downloads from the UKERC EDC mirror. Raises FetchError if the server is
+unreachable or any file returns a non-200 status — no synthetic fallback.
 
 Usage:
-    python scripts/fetch_ukdale_subset.py               # try real, fall back
-    python scripts/fetch_ukdale_subset.py --synthetic   # force synthetic
-    python scripts/fetch_ukdale_subset.py --with-16khz  # also 3 days of 16 kHz FLAC
+    python scripts/fetch_ukdale_subset.py               # download real data
+    python scripts/fetch_ukdale_subset.py --with-16khz  # also synthesize 3 days of 16 kHz FLAC
 """
 from __future__ import annotations
 
@@ -48,8 +46,8 @@ HOUSE_DIR.mkdir(parents=True, exist_ok=True)
 # --------------------------------------------------------------------------- #
 # Real fetch attempt                                                          #
 # --------------------------------------------------------------------------- #
-def _try_fetch_real() -> bool:
-    """Best-effort download of labels + 3 channels. Returns True on success."""
+def _try_fetch_real() -> None:
+    """Download labels + 3 channels. Raises FetchError on any failure."""
     channels = {1: "mains", 5: "washing_machine", 6: "dishwasher"}
     try:
         r = http_get(f"{UKDALE_BASE}/labels.dat", timeout=15)
@@ -62,42 +60,16 @@ def _try_fetch_real() -> bool:
                 raise FetchError(f"channel_{ch}.dat returned {r.status_code}")
             (HOUSE_DIR / f"channel_{ch}.dat").write_bytes(r.content)
             print(f"  channel_{ch}.dat ({len(r.content) / 1e6:.1f} MB)")
-    except Exception as e:  # noqa: BLE001
-        print(f"UKERC unreachable or download failed: {e!r}")
-        return False
-    return True
+    except FetchError:
+        raise
+    except Exception as e:
+        raise FetchError(f"UKERC download failed: {e}") from e
 
 
 # --------------------------------------------------------------------------- #
-# Synthetic generator                                                         #
+# 16 kHz FLAC helpers (onset sampling used only for the optional HF file)    #
 # --------------------------------------------------------------------------- #
 _RNG = np.random.default_rng(20261116)
-
-
-def _dishwasher_cycle(n_sec: int) -> np.ndarray:
-    """2h cycle: heat, wash, heat, rinse/dry."""
-    sec = np.arange(n_sec, dtype=float)
-    p = np.full(n_sec, 3.0)                         # standby
-    # heat 1: 0..20 min
-    p[0 : 20 * 60] = 2200 + _RNG.normal(0, 30, 20 * 60)
-    # wash: 20..60 min
-    p[20 * 60 : 60 * 60] = 150 + _RNG.normal(0, 15, 40 * 60)
-    # heat 2: 60..80 min
-    p[60 * 60 : 80 * 60] = 2100 + _RNG.normal(0, 30, 20 * 60)
-    # rinse/dry: 80..120 min
-    p[80 * 60 : 120 * 60] = 500 + _RNG.normal(0, 40, 40 * 60)
-    return np.clip(p[:n_sec], 0, None)
-
-
-def _washer_cycle(n_sec: int) -> np.ndarray:
-    """1.5h cycle: heat, wash, rinse, spin."""
-    sec = np.arange(n_sec, dtype=float)
-    p = np.full(n_sec, 2.0)
-    p[0 : 15 * 60] = 2100 + _RNG.normal(0, 50, 15 * 60)     # heating element
-    p[15 * 60 : 60 * 60] = 120 + _RNG.normal(0, 25, 45 * 60)  # agitation
-    p[60 * 60 : 75 * 60] = 90 + _RNG.normal(0, 15, 15 * 60)   # rinse pump
-    p[75 * 60 : 90 * 60] = 320 + _RNG.normal(0, 40, 15 * 60)  # final spin (motor)
-    return np.clip(p[:n_sec], 0, None)
 
 
 def _sample_onsets(
@@ -115,80 +87,6 @@ def _sample_onsets(
             onsets.append(start + timedelta(days=d, hours=int(h), minutes=int(m), seconds=int(s)))
     onsets.sort()
     return onsets
-
-
-def _generate_synthetic() -> dict[datetime, list[tuple[str, datetime]]]:
-    """Generate UK-DALE-format .dat files: mains 1 Hz, dishwasher/washer 6 s.
-
-    Returns the onset log for later use.
-    """
-    start = UKDALE_TRAIN_START
-    end = UKDALE_TEST_END
-    total_sec = int((end - start).total_seconds())
-
-    # Hour preferences for onsets (0..23).
-    # Dishwasher: strong late-evening peak (21-23), some after-lunch (14).
-    dish_prefs = np.array(
-        [0.5, 0.3, 0.3, 0.3, 0.3, 0.3, 0.5, 0.8, 1.0, 1.2,
-         1.5, 1.8, 2.5, 2.2, 3.0, 2.0, 1.5, 2.0, 3.0, 3.5,
-         5.0, 8.0, 6.0, 2.5]
-    )
-    # Washer: morning (8-10) and evening (18-20) peaks.
-    wash_prefs = np.array(
-        [0.3, 0.3, 0.3, 0.3, 0.3, 0.5, 1.0, 2.5, 5.5, 6.0,
-         4.5, 3.0, 2.5, 2.0, 2.0, 2.0, 2.5, 4.0, 5.5, 4.5,
-         3.0, 2.0, 1.0, 0.5]
-    )
-
-    dish_onsets = _sample_onsets(start, end, per_day_avg=1.1, hour_prefs=dish_prefs)
-    wash_onsets = _sample_onsets(start, end, per_day_avg=0.9, hour_prefs=wash_prefs)
-
-    print(f"synthetic onsets: dishwasher={len(dish_onsets)} washer={len(wash_onsets)}")
-
-    # --- 6 s per-appliance streams (dishwasher ch6, washer ch5) -----------
-    step = int(UKDALE_SUBMETER_PERIOD_S)  # 6 seconds
-    n_samples = total_sec // step
-    times_s = np.arange(n_samples) * step  # seconds since start
-
-    def _render(onsets: list[datetime], cycle_fn, cycle_len_s: int) -> np.ndarray:
-        sub = np.full(n_samples, 2.0)
-        for on in onsets:
-            t0 = int((on - start).total_seconds())
-            cyc = cycle_fn(cycle_len_s)
-            # downsample cycle 1Hz -> 6s by mean pooling
-            pooled = cyc[: (cycle_len_s // step) * step].reshape(-1, step).mean(axis=1)
-            i0 = t0 // step
-            i1 = min(i0 + len(pooled), n_samples)
-            sub[i0:i1] = pooled[: i1 - i0]
-        return sub
-
-    dish = _render(dish_onsets, _dishwasher_cycle, cycle_len_s=120 * 60)
-    wash = _render(wash_onsets, _washer_cycle, cycle_len_s=90 * 60)
-
-    # --- 1 Hz mains = baseload + fridge-ish cycle + dish + washer ---------
-    mains_n = total_sec
-    t_main = np.arange(mains_n, dtype=float)
-    baseload = 180 + 20 * np.sin(2 * np.pi * t_main / 86400)              # diurnal
-    fridge = 90 * (np.sin(2 * np.pi * t_main / 1800) > 0.3).astype(float)  # on/off
-    # upsample 6s->1s by repetition for dish + wash, clipped to length
-    dish_1s = np.repeat(dish, step)[:mains_n]
-    wash_1s = np.repeat(wash, step)[:mains_n]
-    mains = (baseload + fridge + dish_1s + wash_1s + _RNG.normal(0, 3, mains_n)).clip(min=0)
-
-    # --- Write .dat files in UK-DALE format: "<unix_ts> <power>\n" --------
-    start_unix = int(start.timestamp())
-    ts_mains = start_unix + np.arange(mains_n, dtype=np.int64)
-    ts_sub = start_unix + times_s.astype(np.int64)
-
-    _write_dat(HOUSE_DIR / "channel_1.dat", ts_mains, mains)
-    _write_dat(HOUSE_DIR / "channel_5.dat", ts_sub, wash)
-    _write_dat(HOUSE_DIR / "channel_6.dat", ts_sub, dish)
-
-    labels = "1 aggregate\n5 washing_machine\n6 dishwasher\n"
-    (HOUSE_DIR / "labels.dat").write_text(labels)
-    print(f"wrote {mains_n:,} 1 Hz mains + {n_samples:,} 6 s per-appliance samples")
-
-    return {"dishwasher": dish_onsets, "washing_machine": wash_onsets}
 
 
 def _write_dat(path: Path, ts: np.ndarray, power: np.ndarray) -> None:
@@ -345,29 +243,12 @@ def _generate_synthetic_16khz() -> Path:
 # --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--synthetic", action="store_true",
-                    help="skip network; synthesize the full window")
     ap.add_argument("--with-16khz", action="store_true",
-                    help="also synthesize/download 3 days of 16 kHz FLAC")
+                    help="also synthesize 3 days of 16 kHz FLAC (real HF download not available)")
     args = ap.parse_args()
 
-    # Only require `requests` if we actually hit the network.
-    if not args.synthetic:
-        try:
-            import requests  # noqa: F401
-        except ImportError:
-            args.synthetic = True
-
-    source = "synthetic"
-    if not args.synthetic:
-        print(f"attempting real download from {UKDALE_BASE}")
-        if _try_fetch_real():
-            source = "real"
-        else:
-            print("falling back to synthetic")
-
-    if source == "synthetic":
-        _generate_synthetic()
+    print(f"downloading UK-DALE House 1 from {UKDALE_BASE}")
+    _try_fetch_real()
 
     dfs = _post_process()
 
@@ -390,16 +271,14 @@ def main() -> int:
     }
 
     if args.with_16khz:
-        if source == "real":
-            print("NOTE: real 16 kHz download not implemented; synthesizing 16 kHz slice")
         path16 = _generate_synthetic_16khz()
         files["mains_16khz_flac"] = path16
         extras["hf_source"] = "synthetic"
 
     write_manifest(
         UKDALE_DIR / "MANIFEST.json",
-        source=source,
-        url_base=UKDALE_BASE if source == "real" else None,
+        source="real",
+        url_base=UKDALE_BASE,
         windows={
             "train": (UKDALE_TRAIN_START, UKDALE_TRAIN_END),
             "test": (UKDALE_TEST_START, UKDALE_TEST_END),
