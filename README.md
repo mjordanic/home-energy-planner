@@ -78,26 +78,28 @@ appliances run against EU prices is listed as stretch-goal future work.
 ## Quickstart
 
 ```bash
-# 1) env (Python 3.12, managed by uv)
-uv venv --python 3.12
-uv pip install -e ".[dev]"
+# 1) Python version (pyenv pins 3.12.13 via .python-version in the repo root)
+pyenv install  # reads .python-version; skipped if already installed
 
-# 2) data — each fetcher falls back to synthetic if upstream is unreachable
+# 2) env
+uv sync --extra dev
+
+# 3) data — each fetcher falls back to synthetic if upstream is unreachable
 .venv/bin/python scripts/fetch_ukdale_subset.py
 .venv/bin/python scripts/fetch_ukdale_subset.py --with-16khz   # optional, ~800 MB
 .venv/bin/python scripts/fetch_nyiso_prices.py
 .venv/bin/python scripts/build_signatures.py
 
-# 3) tests
+# 4) tests
 .venv/bin/python -m pytest -q
 
-# 4) notebooks (EDA, signal watcher, forecasts, predictor, optimizer, end-to-end)
+# 5) notebooks (EDA, signal watcher, forecasts, predictor, optimizer, end-to-end)
 .venv/bin/python -m jupyter lab notebooks/
 
-# 5) full 14-day digital-twin simulation on the test slice
+# 6) full 14-day digital-twin simulation on the test slice
 .venv/bin/python -m aerogrid.sim.digital_twin --use-test-window
 
-# 5b) shorter run with a planted price spike to exercise the replan path
+# 6b) shorter run with a planted price spike to exercise the replan path
 .venv/bin/python -m aerogrid.sim.digital_twin --use-test-window --hours 48 --inject-spike
 ```
 
@@ -105,7 +107,7 @@ Optional: to actually run the physics-informed forecaster and zero-shot
 Chronos, install the forecast extras (~1.5 GB of PyTorch):
 
 ```bash
-uv pip install -e ".[forecast]"
+uv sync --extra forecast
 # then, in aerogrid/config.py, keep PRICE_ORACLE_IMPL = "gridfm"
 ```
 
