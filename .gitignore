@@ -1,0 +1,14 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.DS_Store
+data/
+!data/.gitkeep
+*.log
+*.sqlite
+*.sqlite-journal
