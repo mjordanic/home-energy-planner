@@ -2,11 +2,12 @@
 
 Requires ENTSOE_API_KEY in the environment (or .env) and the entsoe-py package
 (`uv sync --extra eu`). Raises FetchError if the key is missing or the API
-call fails — no synthetic fallback. The primary demo market is NYISO via
-fetch_nyiso_prices.py; this script is only needed for the EU alt demo path.
+call fails — no synthetic fallback. The primary EU price source is SMARD via
+fetch_smard_prices.py (no key required); this script is the ENTSO-E alt path.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -27,7 +28,10 @@ from aerogrid.config import (
     ENTSOE_TRAIN_END,
     ENTSOE_TRAIN_START,
 )
+from aerogrid.logging_config import setup_logging
 from scripts._common import FetchError, write_manifest
+
+logger = logging.getLogger(__name__)
 
 load_dotenv(REPO_ROOT / ".env")
 
@@ -36,16 +40,19 @@ def _try_fetch_real(area: str, start: datetime, end: datetime) -> pd.DataFrame:
     """Fetch real ENTSO-E prices. Raises FetchError if key is missing or call fails."""
     key = os.environ.get("ENTSOE_API_KEY", "").strip()
     if not key:
+        logger.error("_try_fetch_real: ENTSOE_API_KEY not set in environment")
         raise FetchError(
             "ENTSOE_API_KEY is not set. Add it to .env or the environment and retry."
         )
     try:
         from entsoe import EntsoePandasClient  # type: ignore
     except ImportError as e:
+        logger.error("_try_fetch_real: entsoe-py not installed")
         raise FetchError(
             "entsoe-py is not installed. Run: uv sync --extra eu"
         ) from e
     try:
+        logger.info("_try_fetch_real: querying ENTSO-E area=%s %s → %s", area, start.date(), end.date())
         cli = EntsoePandasClient(api_key=key)
         s = cli.query_day_ahead_prices(
             area,
@@ -55,10 +62,12 @@ def _try_fetch_real(area: str, start: datetime, end: datetime) -> pd.DataFrame:
         s = s.tz_convert("UTC")
         df = s.reset_index()
         df.columns = ["timestamp", "price_eur_mwh"]
+        logger.info("_try_fetch_real: received %d hourly prices from ENTSO-E", len(df))
         return df
     except FetchError:
         raise
     except Exception as e:
+        logger.error("_try_fetch_real: ENTSO-E API call failed: %s", e)
         raise FetchError(f"ENTSO-E API call failed: {e}") from e
 
 
@@ -80,6 +89,12 @@ def _upsample_to_15min(df_hourly: pd.DataFrame) -> pd.DataFrame:
 
 
 def _tag_split(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a ``split`` column and filter to the ENTSO-E train/test window.
+
+    Rows in ``[ENTSOE_TRAIN_START, ENTSOE_TEST_START)`` are tagged ``"train"``;
+    rows in ``[ENTSOE_TEST_START, ENTSOE_TEST_END)`` are tagged ``"test"``.
+    Rows outside the window are dropped.
+    """
     s = pd.Series("train", index=df.index, dtype="object")
     s.loc[df["timestamp"] >= ENTSOE_TEST_START] = "test"
     df["split"] = s.astype("category")
@@ -87,8 +102,13 @@ def _tag_split(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> int:
+    """Fetch ENTSO-E day-ahead prices, upsample to 15 min, tag splits, write parquet and manifest."""
+    setup_logging(level=logging.INFO, console=True)
+    logger.info(
+        "fetch_entsoe_prices: area=%s %s → %s",
+        ENTSOE_AREA, ENTSOE_TRAIN_START.date(), ENTSOE_TEST_END.date(),
+    )
     df = _try_fetch_real(ENTSOE_AREA, ENTSOE_TRAIN_START, ENTSOE_TEST_END)
-    print(f"ENTSO-E: got {len(df)} hourly prices for {ENTSOE_AREA}")
 
     df15 = _tag_split(_upsample_to_15min(df))
     out = ENTSOE_DIR / "de_lu_15min.parquet"
@@ -110,7 +130,7 @@ def main() -> int:
         files={"de_lu_15min_parquet": out},
         extras={"area": ENTSOE_AREA, "rows_15min": int(len(df15))},
     )
-    print("done.")
+    logger.info("fetch_entsoe_prices: done rows_15min=%d", len(df15))
     return 0
 
 

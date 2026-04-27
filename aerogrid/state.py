@@ -1,4 +1,10 @@
-"""LangGraph state schema."""
+"""LangGraph state schema.
+
+The graph is a streaming sample processor: every 1 Hz sample enters through
+``latest_sample`` and, when TriggerManager says so, a replan pass populates
+``current_plan`` / ``committed_until`` / ``replan_reason``. All fields are
+optional (``total=False``) so nodes can write incrementally.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,38 +12,47 @@ from typing import Any, TypedDict
 
 import numpy as np
 
-from aerogrid.types import ApplianceOnset, PriceForecast, Schedule
+from aerogrid.types import (
+    ApplianceOnset,
+    HITLDecision,
+    PriceForecast,
+    ReplanTrigger,
+    Sample,
+    Schedule,
+    ScheduledTask,
+)
 
 
 class AeroGridState(TypedDict, total=False):
-    """State carried between LangGraph nodes.
-
-    Fields are all optional (`total=False`) so nodes can populate incrementally.
-    """
-    # time and sensor inputs
+    # ---- Streaming ---- #
     now: datetime
-    mains_chunk: tuple[np.ndarray, np.ndarray] | None   # (voltage, current), 16 kHz
-    chunk_start: datetime | None
+    latest_sample: Sample
 
-    # NILM output + history
-    new_onsets: list[ApplianceOnset]
-    recent_onsets: list[ApplianceOnset]
+    # ---- Disaggregation (updated every sample) ---- #
+    per_appliance_power_w: dict[str, float]
+    new_onsets: list[ApplianceOnset]           # onsets detected since last state flush
+    recent_onsets: list[ApplianceOnset]        # rolling history, capped
 
-    # forecasting + planning
-    price_forecast: PriceForecast | None
-    onset_probs: dict[str, np.ndarray]
-    schedule: Schedule | None
+    # ---- Commitment (updated every sample + on replan) ---- #
+    committed_tasks: list[ScheduledTask]       # currently running, cannot be preempted
+    ev_power_setpoint_kw: float                # current EV charge rate
+    remaining_ev_kwh: float                    # kWh still owed to meet deadline
 
-    # HITL
+    # ---- Planning (updated on replan only) ---- #
+    price_forecast: PriceForecast | None       # short-horizon forecast
+    onset_probs: dict[str, np.ndarray]         # per-appliance behavioral priors
+    current_plan: Schedule | None              # output of last replan
+    previous_plan: Schedule | None             # last confirmed plan, for HITL diff
+    committed_until: datetime | None           # first slot(s) of plan now committed
+    last_replan_at: datetime | None
+    replan_trigger: ReplanTrigger | None
+
+    # ---- HITL ---- #
+    hitl_decision: HITLDecision | None
     pending_question: str | None
     user_confirmation: str | None
 
-    # monitor / replan
-    realized_prices: list[float]            # each slot's realized price, appended
-    replan_reason: str | None
-    iteration: int                          # how many graph cycles we've completed
-
-    # housekeeping
+    # ---- Monitoring / bookkeeping ---- #
     cumulative_cost: float
     cumulative_baseline_cost: float
     event_log: list[dict[str, Any]]

@@ -1,119 +1,111 @@
-"""Replay UK-DALE test-slice data as a mock smart meter.
+"""1 Hz sample streamer backed by scenario parquet.
 
-The streamer produces, per 15-min tick in the test window:
-  - a list of ground-truth ApplianceOnsets that occurred in the slot
-    (drawn from onsets.parquet so the graph always has *some* NILM signal,
-     even when 16 kHz data isn't available for that slot)
-  - optionally a (voltage, current) 16 kHz chunk if the slot overlaps the
-    3-day / 6-h 16 kHz FLAC slice — when present, the real SignalWatcher
-    runs in the graph.
+Reads ``mains_1hz.parquet`` from the scenario directory and yields one
+``Sample`` per simulated second, attaching the 15-min realized LBMP (from the
+:class:`aerogrid.sim.price_server.PriceServer`) when a slot boundary crosses.
+
+The streamer is deliberately thin — it contains no disaggregation logic, no
+onset detection, and no scheduling. The digital twin's inner loop is
+responsible for feeding each sample into the disaggregator, commit tracker,
+and trigger manager.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
-import numpy as np
 import pandas as pd
 
-from aerogrid.behavioral_predictor import load_onsets
 from aerogrid.config import (
+    SCENARIO_DIR,
+    SCENARIO_TEST_END,
+    SCENARIO_TEST_START,
     SLOT_MINUTES,
-    UKDALE_16KHZ_END,
-    UKDALE_16KHZ_START,
-    UKDALE_DIR,
-    UKDALE_HF_HZ,
-    UKDALE_TEST_END,
-    UKDALE_TEST_START,
 )
-from aerogrid.types import ApplianceOnset
+from aerogrid.types import Sample
+
+logger = logging.getLogger(__name__)
+
+
+def _slot_floor(t: datetime) -> datetime:
+    """Round ``t`` down to the start of its 15-min slot (zeroes seconds/μs)."""
+    return t.replace(
+        minute=(t.minute // SLOT_MINUTES) * SLOT_MINUTES,
+        second=0,
+        microsecond=0,
+    )
 
 
 @dataclass
-class Tick:
-    now: datetime
-    new_onsets: list[ApplianceOnset]
-    mains_chunk: tuple[np.ndarray, np.ndarray] | None
-    chunk_start: datetime | None
+class ScenarioStreamer:
+    """Iterate a pre-generated scenario's mains at 1 Hz."""
+    mains_path: Path | None = None
+    realized_price_provider: Callable[[datetime], float | None] | None = None
 
+    def _load(self) -> pd.DataFrame:
+        """Load, tz-localise, and sort the mains parquet into a DataFrame."""
+        path = self.mains_path or (SCENARIO_DIR / "mains_1hz.parquet")
+        logger.info("ScenarioStreamer._load: reading mains from %s", path)
+        if not path.exists():
+            logger.error(
+                "ScenarioStreamer._load: mains parquet not found at %s — run generate_scenario.py", path,
+            )
+            raise FileNotFoundError(
+                f"no scenario mains at {path}. Run scripts/generate_scenario.py first."
+            )
+        df = pd.read_parquet(path)
+        if df["timestamp"].dt.tz is None:
+            df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        logger.info("ScenarioStreamer._load: loaded %d samples", len(df))
+        return df
 
-class Streamer:
-    """Iterate the test window at 15-min cadence."""
-
-    def __init__(self, flac_path: Path | None = None):
-        self.onsets = load_onsets()
-        self.test_onsets = self.onsets[self.onsets["split"] == "test"].copy()
-        self.test_onsets["timestamp"] = self.test_onsets["timestamp"].dt.tz_convert("UTC")
-
-        self._flac_path = flac_path or (UKDALE_DIR / "house_1" / "mains_16khz_3day.flac")
-        self._flac_cache: tuple[np.ndarray, np.ndarray, int, datetime] | None = None
-
-    def _load_flac(self):
-        if not self._flac_path.exists():
-            return None
-        if self._flac_cache is not None:
-            return self._flac_cache
-        import soundfile as sf
-        data, fs = sf.read(self._flac_path, always_2d=True)
-        voltage = data[:, 0] * 300.0
-        current = data[:, 1] * 15.0
-        self._flac_cache = (voltage.astype(np.float32),
-                            current.astype(np.float32), int(fs),
-                            UKDALE_16KHZ_START)
-        return self._flac_cache
-
-    # ------------------------------------------------------------------ #
-    def iter_ticks(
+    def iter_samples(
         self,
         start: datetime | None = None,
         end: datetime | None = None,
-        hf_every_n_ticks: int = 24,          # 1x per 6 h by default
-    ) -> Iterator[Tick]:
-        start = start or UKDALE_TEST_START
-        end = end or UKDALE_TEST_END
-        tick_dt = timedelta(minutes=SLOT_MINUTES)
+    ) -> Iterator[Sample]:
+        """Yield one :class:`~aerogrid.types.Sample` per simulated second.
 
-        now = start
-        idx = 0
-        while now < end:
-            slot_end = now + tick_dt
-            mask = (
-                (self.test_onsets["timestamp"] >= now)
-                & (self.test_onsets["timestamp"] < slot_end)
-            )
-            onsets: list[ApplianceOnset] = []
-            for _, row in self.test_onsets[mask].iterrows():
-                onsets.append(
-                    ApplianceOnset(
-                        appliance=row["appliance"],
-                        timestamp=row["timestamp"].to_pydatetime(),
-                        confidence=1.0,
-                        source="ground_truth",
-                    )
+        The first sample at each 15-min slot boundary carries a non-``None``
+        ``realized_price`` (fetched from ``realized_price_provider``); all
+        other samples in the slot have ``realized_price=None``.
+
+        Args:
+            start: First timestamp to include (defaults to ``SCENARIO_TEST_START``).
+            end:   Exclusive upper bound (defaults to ``SCENARIO_TEST_END``).
+
+        Yields:
+            :class:`~aerogrid.types.Sample` instances in chronological order.
+        """
+        df = self._load()
+        start = start or SCENARIO_TEST_START
+        end = end or SCENARIO_TEST_END
+        mask = (df["timestamp"] >= start) & (df["timestamp"] < end)
+        window = df.loc[mask]
+        logger.info(
+            "ScenarioStreamer.iter_samples: window %s → %s (%d samples)",
+            start.isoformat(), end.isoformat(), len(window),
+        )
+
+        last_slot: datetime | None = None
+        provider = self.realized_price_provider
+        n_slots = 0
+        for row in window.itertuples(index=False):
+            t: datetime = row.timestamp.to_pydatetime()
+            slot = _slot_floor(t)
+            realized: float | None = None
+            if slot != last_slot:
+                # Fresh 15-min boundary — pull realized price once.
+                realized = provider(slot) if provider is not None else None
+                last_slot = slot
+                n_slots += 1
+                logger.debug(
+                    "ScenarioStreamer: new slot boundary slot=%s realized_price=%s",
+                    slot.isoformat(), f"{realized:.2f}" if realized is not None else "None",
                 )
-
-            chunk = None
-            chunk_t = None
-            hf = self._load_flac()
-            if hf is not None and (idx % hf_every_n_ticks == 0):
-                voltage, current, fs, flac_start = hf
-                # Grab the slot's worth of HF if it's inside the FLAC window.
-                if UKDALE_16KHZ_START <= now < UKDALE_16KHZ_END:
-                    rel = (now - flac_start).total_seconds()
-                    n_samples = fs * SLOT_MINUTES * 60
-                    s0 = int(rel * fs)
-                    s1 = s0 + n_samples
-                    if 0 <= s0 and s1 <= len(voltage):
-                        chunk = (voltage[s0:s1], current[s0:s1])
-                        chunk_t = now
-
-            yield Tick(
-                now=now,
-                new_onsets=onsets,
-                mains_chunk=chunk,
-                chunk_start=chunk_t,
-            )
-            now = slot_end
-            idx += 1
+            yield Sample(t=t, p_mains_w=float(row.power_w), realized_price=realized)
+        logger.info("ScenarioStreamer.iter_samples: finished streaming %d slots", n_slots)

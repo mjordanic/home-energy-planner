@@ -1,4 +1,4 @@
-"""Mock 15-min price feed backed by the NYISO test parquet.
+"""Mock 15-min price feed backed by the configured price parquet (SMARD by default).
 
 Exposes two callables that the LangGraph nodes can bind as providers:
   history_provider(now) -> pd.DataFrame  (timestamp, lbmp) strictly < now
@@ -9,6 +9,7 @@ the replan path without waiting for a naturally-volatile slot.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,8 @@ import pandas as pd
 from aerogrid.config import SLOT_MINUTES
 from aerogrid.price_oracle import load_price_history
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class PriceServer:
@@ -26,9 +29,16 @@ class PriceServer:
     spike_magnitude: float = 150.0          # $/MWh added
 
     def __post_init__(self):
+        """Sort the price DataFrame by timestamp on construction."""
         self.prices = self.prices.sort_values("timestamp").reset_index(drop=True)
+        logger.info(
+            "PriceServer: initialised with %d price rows spike_at=%s",
+            len(self.prices),
+            self.spike_at.isoformat() if self.spike_at else "None",
+        )
 
     def _slot_for(self, now: datetime) -> datetime:
+        """Round ``now`` down to the start of its 15-min slot (zeroes seconds/μs)."""
         floor = (now.minute // SLOT_MINUTES) * SLOT_MINUTES
         return now.replace(minute=floor, second=0, microsecond=0)
 
@@ -41,8 +51,14 @@ class PriceServer:
         slot = self._slot_for(now)
         row = self.prices[self.prices["timestamp"] == slot]
         if row.empty:
+            logger.warning("PriceServer.realized: no price row for slot=%s", slot.isoformat())
             return None
         price = float(row["lbmp"].iloc[0])
         if self.spike_at is not None and self._slot_for(self.spike_at) == slot:
+            logger.info(
+                "PriceServer.realized: spike applied at slot=%s +%.2f → price=%.2f",
+                slot.isoformat(), self.spike_magnitude, price + self.spike_magnitude,
+            )
             price += self.spike_magnitude
+        logger.debug("PriceServer.realized: slot=%s price=%.2f", slot.isoformat(), price)
         return price
