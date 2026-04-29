@@ -1,12 +1,13 @@
 """Unit tests for the HITL decision policy."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from aerogrid.hitl_policy import _in_sleep_window, decide
-from aerogrid.types import Schedule, ScheduledTask
+from aerogrid.config import HITL_RESCHEDULE_MIN_SAVINGS_EUR
+from aerogrid.hitl_policy import _in_sleep_window, decide, decide_reschedule
+from aerogrid.types import RescheduleProposal, Schedule, ScheduledTask
 
 
 SLOT_START = datetime(2024, 12, 20, 0, 0, tzinfo=timezone.utc)     # midnight
@@ -15,6 +16,7 @@ SLOT_START = datetime(2024, 12, 20, 0, 0, tzinfo=timezone.utc)     # midnight
 def _plan(
     *,
     ev_setpoint_kw: float = 3.0,
+    heater_setpoint_kw: float = 1.0,
     dish_start: int = 20 * 4,    # 20:00
     wash_start: int | None = None,
     cost: float = 1.0,
@@ -37,12 +39,15 @@ def _plan(
         slot_start=SLOT_START,
         horizon_slots=96,
         ev_power_kw=[ev_setpoint_kw] * 96,
+        heater_power_kw=[heater_setpoint_kw] * 96,
         tasks=tasks,
         expected_cost=cost,
         baseline_cost=cost * 1.5,
     )
 
 
+# --------------------------------------------------------------------------- #
+# Plan-level decisions                                                        #
 # --------------------------------------------------------------------------- #
 def test_first_plan_always_asks():
     d = decide(old_plan=None, new_plan=_plan())
@@ -92,7 +97,6 @@ def test_new_appliance_asks():
 
 
 def test_shift_into_sleep_window_asks():
-    # Old: 20:00 → New: 23:00 (into sleep hours).
     old = _plan(dish_start=20 * 4)
     new = _plan(dish_start=23 * 4)
     d = decide(old, new)
@@ -102,8 +106,6 @@ def test_shift_into_sleep_window_asks():
 
 def test_committed_task_is_not_prompted():
     old = _plan(dish_start=20 * 4, dish_committed=True)
-    # Shift in the proposed plan (but new also marks it committed — the policy
-    # skips when either side is committed).
     new = _plan(dish_start=21 * 4, dish_committed=True)
     assert decide(old, new).action == "auto"
 
@@ -124,3 +126,63 @@ def test_sleep_window_wrap_around():
     assert _in_sleep_window(time(5, 30), s, e)
     assert not _in_sleep_window(time(12, 0), s, e)
     assert not _in_sleep_window(time(21, 59), s, e)
+
+
+# --------------------------------------------------------------------------- #
+# Reschedule proposals                                                        #
+# --------------------------------------------------------------------------- #
+def _proposal(
+    *,
+    appliance: str = "dishwasher",
+    shift_min: float = 90.0,
+    cost_now: float = 1.20,
+    cost_proposed: float = 0.85,
+) -> RescheduleProposal:
+    onset_at = SLOT_START.replace(hour=20, minute=0)
+    return RescheduleProposal(
+        appliance=appliance,
+        onset_at=onset_at,
+        proposed_start_at=onset_at + timedelta(minutes=shift_min),
+        cycle_slots=8,
+        rated_kw=2.5,
+        cost_now_eur=cost_now,
+        cost_proposed_eur=cost_proposed,
+    )
+
+
+def test_reschedule_no_proposal_is_auto():
+    d = decide_reschedule(None)
+    assert d.action == "auto"
+
+
+def test_reschedule_zero_shift_is_auto():
+    p = _proposal(shift_min=0.0)
+    d = decide_reschedule(p)
+    assert d.action == "auto"
+
+
+def test_reschedule_big_savings_is_ask():
+    p = _proposal(shift_min=90.0, cost_now=1.20, cost_proposed=0.85)
+    d = decide_reschedule(p)
+    assert d.action == "ask"
+    assert "dishwasher" in d.question
+    assert "0.35" in d.question or "0.4" in d.question  # approx € savings
+
+
+def test_reschedule_below_threshold_is_auto():
+    """Savings below HITL_RESCHEDULE_MIN_SAVINGS_EUR → auto-decline."""
+    p = _proposal(
+        shift_min=90.0,
+        cost_now=1.00,
+        cost_proposed=1.00 - HITL_RESCHEDULE_MIN_SAVINGS_EUR / 2,
+    )
+    d = decide_reschedule(p)
+    assert d.action == "auto"
+
+
+def test_reschedule_question_mentions_appliance_and_savings():
+    p = _proposal(appliance="washing_machine", shift_min=60.0, cost_now=2.0, cost_proposed=1.5)
+    d = decide_reschedule(p)
+    assert "washing_machine" in d.question
+    assert "1.0" in d.question or "1 h" in d.question
+    assert "0.5" in d.question

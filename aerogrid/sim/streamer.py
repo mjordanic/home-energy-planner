@@ -8,11 +8,18 @@ The streamer is deliberately thin — it contains no disaggregation logic, no
 onset detection, and no scheduling. The digital twin's inner loop is
 responsible for feeding each sample into the disaggregator, commit tracker,
 and trigger manager.
+
+For testing the HITL reschedule flow we expose a small *injection* hook:
+:meth:`add_onset` schedules an :class:`~aerogrid.types.ApplianceOnset` to be
+emitted at a specific wall-clock time, and :meth:`consume_injected_onsets`
+drains any onsets whose timestamp is at or before ``now``. The digital twin
+calls ``consume_injected_onsets`` once per sample so injected events flow
+through the same trigger / graph machinery as natural onsets.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterator
@@ -25,7 +32,7 @@ from aerogrid.config import (
     SCENARIO_TEST_START,
     SLOT_MINUTES,
 )
-from aerogrid.types import Sample
+from aerogrid.types import ApplianceOnset, Sample
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,47 @@ class ScenarioStreamer:
     """Iterate a pre-generated scenario's mains at 1 Hz."""
     mains_path: Path | None = None
     realized_price_provider: Callable[[datetime], float | None] | None = None
+    # Pending injected onsets, sorted by timestamp ascending.
+    _injected_onsets: list[ApplianceOnset] = field(default_factory=list)
+
+    def add_onset(
+        self,
+        appliance: str,
+        timestamp: datetime,
+        confidence: float = 1.0,
+    ) -> None:
+        """Queue an extra :class:`ApplianceOnset` for emission at ``timestamp``.
+
+        Used by the notebook stress tests and integration tests to slam the
+        agent with arbitrary appliance starts on top of (or instead of) the
+        natural scenario draws. The injected onset is delivered to the
+        digital twin via :meth:`consume_injected_onsets` exactly once at
+        the first sample at or after ``timestamp``.
+        """
+        onset = ApplianceOnset(
+            appliance=appliance,
+            timestamp=timestamp,
+            confidence=float(confidence),
+            source="injected",
+        )
+        self._injected_onsets.append(onset)
+        self._injected_onsets.sort(key=lambda o: o.timestamp)
+        logger.info(
+            "ScenarioStreamer.add_onset: queued appliance=%s at=%s",
+            appliance, timestamp.isoformat(),
+        )
+
+    def consume_injected_onsets(self, now: datetime) -> list[ApplianceOnset]:
+        """Pop and return all injected onsets whose timestamp is ≤ ``now``."""
+        ready: list[ApplianceOnset] = []
+        while self._injected_onsets and self._injected_onsets[0].timestamp <= now:
+            ready.append(self._injected_onsets.pop(0))
+        if ready:
+            logger.debug(
+                "ScenarioStreamer.consume_injected_onsets: emitting %d onset(s) at=%s",
+                len(ready), now.isoformat(),
+            )
+        return ready
 
     def _load(self) -> pd.DataFrame:
         """Load, tz-localise, and sort the mains parquet into a DataFrame."""
@@ -99,7 +147,6 @@ class ScenarioStreamer:
             slot = _slot_floor(t)
             realized: float | None = None
             if slot != last_slot:
-                # Fresh 15-min boundary — pull realized price once.
                 realized = provider(slot) if provider is not None else None
                 last_slot = slot
                 n_slots += 1

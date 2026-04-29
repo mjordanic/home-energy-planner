@@ -30,6 +30,7 @@ import pandas as pd
 
 from aerogrid.config import (
     APPLIANCES,
+    EV_AVAILABLE_FROM_HOUR,
     EV_DAILY_NEED_KWH,
     SCENARIO_DIR,
     SCENARIO_TEST_START,
@@ -128,9 +129,13 @@ def natural_cycle_times(
 def daily_ev_cycle_times(
     start: datetime,
     end: datetime,
-    plug_in_hour: int = 19,
+    plug_in_hour: int = EV_AVAILABLE_FROM_HOUR,
 ) -> tuple[datetime, ...]:
-    """One EV plug-in per day at ``plug_in_hour`` local (UTC)."""
+    """One EV plug-in per day at ``plug_in_hour`` local (UTC).
+
+    Defaults to :data:`aerogrid.config.EV_AVAILABLE_FROM_HOUR` so the simulator
+    and the optimiser agree on when the EV becomes pluggable.
+    """
     n_days = max(0, (end - start).days)
     out: list[datetime] = []
     for d in range(n_days):
@@ -196,9 +201,17 @@ def default_scenario_spec(
     )
 
     # ---- Cycle durations ---- #
+    # Dishwasher and washing machine remain cycle-based event-driven loads
+    # (the user starts them; the agent only proposes a reschedule).
     dish_cycle_s   = dish_spec.cycle_slots   * SLOT_MINUTES * 60   # 7 200 s
     wash_cycle_s   = wash_spec.cycle_slots   * SLOT_MINUTES * 60   # 5 400 s
-    heater_cycle_s = heater_spec.cycle_slots * SLOT_MINUTES * 60   # 3 600 s
+    # Heater is now a continuous variable-power load controlled by the MILP;
+    # it no longer has a fixed cycle length in the appliance spec. The
+    # scenario still emits 1-hour "natural" heater bursts as background noise
+    # so the disaggregator/onset detector have signal to learn from on the
+    # train split, but the bursts have no semantic meaning in the test split
+    # (the agent's heater setpoint drives realised cost there).
+    heater_cycle_s = 3600
     ev_cycle_s     = int(EV_DAILY_NEED_KWH / ev_spec.rated_kw * 3600)  # ≈ 12 343 s
 
     # Fridge runs continuously — one very long "cycle" spanning the full window.
@@ -216,12 +229,14 @@ def default_scenario_spec(
         start, end,
         peak_hour=10.5, hour_spread=1.0, cycles_per_week=7.0, rng=rng,
     )
-    # EV every day at 19:00 (user comes home from work).
-    ev_starts = daily_ev_cycle_times(start, end, plug_in_hour=19)
+    # EV every day at the configured plug-in hour (default 20:00 UTC).
+    ev_starts = daily_ev_cycle_times(start, end, plug_in_hour=EV_AVAILABLE_FROM_HOUR)
 
-    # Heater natural start: 1 h before each comfort deadline so the space is
-    # warm at 07:00 and 18:00.  The MILP may shift these starts even earlier
-    # when pre-deadline prices are cheaper, but never later (hard constraint).
+    # Heater natural start: 1 h before each comfort hour, so a "natural" thermostat
+    # household would have warm space by 07:00 and 18:00. These bursts now play
+    # the role of training signal for the behavioural predictor and ambient noise
+    # in the disaggregator — the optimiser controls the heater continuously and
+    # ignores cycle-shaped natural draws when sizing its setpoint.
     heater_starts = natural_cycle_times(
         start, end,
         peak_hour=6.0, hour_spread=0.5, cycles_per_week=5.0, rng=rng,

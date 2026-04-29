@@ -1,15 +1,23 @@
 """Pure policy: should we interrupt the user about this plan change?
 
-Inputs: old ``Schedule`` (the last user-confirmed or auto-committed plan),
-new ``Schedule`` (fresh from the MILP). Output: ``HITLDecision(action, ...)``.
+Inputs vary by call site:
 
-AUTO when:
+* **Plan-level**: ``decide(old_plan, new_plan)`` — used at the end of a
+  generic replan. AUTO when the new plan only nudges existing setpoints
+  within tolerance; ASK when a setpoint or cost moves significantly.
+* **Reschedule-proposal**: ``decide_reschedule(proposal)`` — used after a
+  ``new_onset`` trigger when an event-driven cycle appliance (dishwasher /
+  washing machine) was started. Returns ASK with a savings-aware question
+  when the proposed shift saves ≥ ``HITL_RESCHEDULE_MIN_SAVINGS_EUR``;
+  AUTO ("decline / run now") when there is no useful savings.
+
+Plan-level AUTO when:
   - first call with no new plan → nothing to approve.
   - only EV setpoint changed by < HITL_EV_TOLERANCE_KW.
   - tentative (non-committed) task starts shifted by < HITL_SHIFT_TOLERANCE_MIN.
   - new cost ≤ old cost + a small bump.
 
-ASK when:
+Plan-level ASK when:
   - first plan (no prior user confirmation).
   - a new appliance is being scheduled.
   - any non-committed start moves by ≥ HITL_ASK_SHIFT_MIN.
@@ -25,11 +33,12 @@ from aerogrid.config import (
     HITL_ASK_SHIFT_MIN,
     HITL_COST_BUMP_USD,
     HITL_EV_TOLERANCE_KW,
+    HITL_RESCHEDULE_MIN_SAVINGS_EUR,
     SLEEP_WINDOW_END,
     SLEEP_WINDOW_START,
     SLOT_MINUTES,
 )
-from aerogrid.types import HITLDecision, Schedule
+from aerogrid.types import HITLDecision, RescheduleProposal, Schedule
 
 logger = logging.getLogger(__name__)
 
@@ -54,33 +63,11 @@ def decide(
     ask_shift_min: float = HITL_ASK_SHIFT_MIN,
     cost_bump_usd: float = HITL_COST_BUMP_USD,
 ) -> HITLDecision:
-    """Determine whether to auto-commit or ask the user about a plan change.
+    """Plan-level decision: auto-commit or ask the user about a plan change.
 
-    This is a pure function with no side effects — it only inspects the two
-    plans and returns a decision.  The graph node ``n_hitl_gate`` is
+    Pure function — no side effects. The graph node ``n_hitl_gate`` is
     responsible for acting on the decision (calling ``interrupt()`` when
     ``action == "ask"``).
-
-    Decision logic (evaluated in order):
-    1. No new plan → ``AUTO`` (nothing to approve).
-    2. No prior plan → ``ASK`` (first plan, always confirm).
-    3. New appliance appears → ``ASK``.
-    4. Non-committed task start crosses into the sleep window → ``ASK``.
-    5. Non-committed task start shifts ≥ ``ask_shift_min`` minutes → ``ASK``.
-    6. EV slot-0 setpoint changes by > ``ev_tolerance_kw`` → ``ASK``.
-    7. Expected cost rises by > ``cost_bump_usd`` → ``ASK``.
-    8. Otherwise → ``AUTO``.
-
-    Args:
-        old_plan: Last confirmed or auto-committed plan; ``None`` on first call.
-        new_plan: Fresh plan from the MILP optimizer.
-        ev_tolerance_kw: EV setpoint delta below which the change is auto-accepted.
-        ask_shift_min: Task start shift (minutes) at or above which the user is asked.
-        cost_bump_usd: Cost increase (currency units) above which the user is asked.
-
-    Returns:
-        :class:`HITLDecision` with ``action`` in ``{"auto", "ask"}`` and a
-        human-readable ``reason`` (and ``question`` when ``action == "ask"``).
     """
     logger.debug(
         "hitl_policy.decide: old_plan=%s new_plan=%s",
@@ -96,15 +83,17 @@ def decide(
     if old_plan is None:
         n = len(new_plan.tasks)
         ev_kw = new_plan.ev_power_kw[0] if new_plan.ev_power_kw else 0.0
+        heater_kw = new_plan.heater_power_kw[0] if new_plan.heater_power_kw else 0.0
         logger.info(
-            "hitl_policy.decide: ASK — first plan (tasks=%d ev_setpoint=%.1fkW)",
-            n, ev_kw,
+            "hitl_policy.decide: ASK — first plan (tasks=%d ev_setpoint=%.1fkW heater_setpoint=%.1fkW)",
+            n, ev_kw, heater_kw,
         )
         return HITLDecision(
             action="ask",
             reason="first plan",
             question=(
-                f"First plan: {n} appliance(s), EV setpoint {ev_kw:.1f} kW. Accept? (yes/no)"
+                f"First plan: {n} committed task(s), EV setpoint {ev_kw:.1f} kW, "
+                f"heater setpoint {heater_kw:.1f} kW. Accept? (yes/no)"
             ),
         )
 
@@ -214,4 +203,61 @@ def decide(
     return HITLDecision(action="auto", reason="within tolerance")
 
 
-__all__ = ["decide"]
+def decide_reschedule(
+    proposal: RescheduleProposal | None,
+    *,
+    min_savings_eur: float = HITL_RESCHEDULE_MIN_SAVINGS_EUR,
+) -> HITLDecision:
+    """Decide whether to ask the user about a proposed appliance shift.
+
+    A proposal is only forwarded to the user when ``savings_eur ≥
+    min_savings_eur`` AND the shift is non-zero. For below-threshold
+    savings or zero shifts we *auto-decline* (run the cycle at the original
+    onset time) — there's nothing useful to ask about.
+
+    Args:
+        proposal: The reschedule offer from the optimiser, or ``None``.
+        min_savings_eur: Below this we don't bother asking the user.
+
+    Returns:
+        ``HITLDecision(action="ask")`` with a human-readable question
+        framed in terms of savings, or ``HITLDecision(action="auto",
+        reason="run now")`` when the proposal isn't worth asking about.
+    """
+    if proposal is None:
+        return HITLDecision(action="auto", reason="no reschedule proposal")
+    if proposal.shift_minutes <= 0.5:
+        # 30 s tolerance: anything tighter is just rounding noise.
+        return HITLDecision(action="auto", reason="no useful shift")
+    if proposal.savings_eur < min_savings_eur:
+        logger.info(
+            "hitl_policy.decide_reschedule: AUTO run-now — savings €%.3f < threshold €%.3f",
+            proposal.savings_eur, min_savings_eur,
+        )
+        return HITLDecision(
+            action="auto",
+            reason=(
+                f"savings €{proposal.savings_eur:.2f} < threshold €{min_savings_eur:.2f}"
+            ),
+        )
+    shift_h = proposal.shift_minutes / 60.0
+    propose_str = proposal.proposed_start_at.strftime("%H:%M")
+    question = (
+        f"Postpone {proposal.appliance} by {shift_h:.1f} h to {propose_str}? "
+        f"You can save €{proposal.savings_eur:.2f}. (accept/decline)"
+    )
+    logger.info(
+        "hitl_policy.decide_reschedule: ASK — %s shift %.0fmin saves €%.2f",
+        proposal.appliance, proposal.shift_minutes, proposal.savings_eur,
+    )
+    return HITLDecision(
+        action="ask",
+        reason=(
+            f"{proposal.appliance} shift {proposal.shift_minutes:.0f}min "
+            f"saves €{proposal.savings_eur:.2f}"
+        ),
+        question=question,
+    )
+
+
+__all__ = ["decide", "decide_reschedule"]

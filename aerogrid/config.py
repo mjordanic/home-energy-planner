@@ -3,6 +3,20 @@
 Date windows, appliance specs, paths, and model/horizon/trigger/HITL tuning
 all live here so scripts, notebooks, and the digital twin agree on the same
 constants.
+
+After the *intent-driven* refactor of April 2026, the optimizer treats two
+loads as continuous variable-power and the rest as event-driven:
+
+* **EV charger** — continuous power, hard energy deadline at 07:00 UTC,
+  hard availability gate (no charging before :data:`EV_AVAILABLE_FROM_HOUR`).
+* **Heater** — continuous power, multiple energy windows specified in
+  :data:`HEATER_DEADLINES`. Each window has its own kWh target.
+* **Dishwasher / washing machine** — *event-driven*. The user starts them;
+  the agent only proposes a *small reschedule* (≤ :data:`HITL_RESCHEDULE_WINDOW_HOURS`
+  hours forward) if it would save more than
+  :data:`HITL_RESCHEDULE_MIN_SAVINGS_EUR`. Whether the simulated user
+  accepts is per-appliance and lives in :data:`HITL_AUTO_RESPONSES`.
+* **Fridge** — always-on background load, never scheduled.
 """
 from __future__ import annotations
 
@@ -55,15 +69,15 @@ ENTSOE_AREA = "DE_LU"
 
 # SMARD DE-LU — free, no key, 15-min native, primary EU price source.
 SMARD_TRAIN_START = _utc(2026, 1, 12)
-SMARD_TRAIN_END = _utc(2026, 4, 3)  #5       
+SMARD_TRAIN_END = _utc(2026, 4, 3)
 SMARD_TEST_START = _utc(2026, 4, 3)
-SMARD_TEST_END = _utc(2026, 4, 19)        
+SMARD_TEST_END = _utc(2026, 4, 19)
 
 # Scenario — aligned with SMARD so the agent runs on real DE-LU prices.
 SCENARIO_TRAIN_START = SMARD_TRAIN_START
-SCENARIO_TRAIN_END = SMARD_TRAIN_END       # 83 training days for behavioral predictor
+SCENARIO_TRAIN_END = SMARD_TRAIN_END        # training days for behavioral predictor
 SCENARIO_TEST_START = SMARD_TEST_START
-SCENARIO_TEST_END = SMARD_TEST_END         # 14 test days for streaming simulation
+SCENARIO_TEST_END = SMARD_TEST_END          # streaming-simulation days
 
 
 # --------------------------------------------------------------------------- #
@@ -71,23 +85,43 @@ SCENARIO_TEST_END = SMARD_TEST_END         # 14 test days for streaming simulati
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ApplianceSpec:
+    """Static description of one appliance.
+
+    ``cycle_slots`` is non-zero only for *event-driven cycle appliances*
+    (dishwasher, washing machine) — appliances the user starts and that
+    run a fixed-shape cycle of known length and rated power. The continuous
+    loads (EV, heater) and the always-on fridge use ``cycle_slots = 0``;
+    their behaviour is modelled by their own dedicated MILP variables
+    (EV / heater) or as constant background load (fridge).
+    """
     name: str
     rated_kw: float
-    cycle_slots: int             # number of 15-min slots a cycle occupies
+    cycle_slots: int             # 0 for continuous / always-on loads
     on_power_threshold_w: float
     max_power_w: float
-    bufferable: bool             # True => MILP may shift this load in time
-    deadline_hours: tuple[int, ...] = ()
-    # UTC hours by which each cycle must have *finished*. Empty = no deadline.
-    # For heater/AC: (7, 18) means pre-heat must be done before 07:00 and
-    # 18:00 each day. The MILP enforces this as a hard start-before constraint.
+    bufferable: bool             # True => MILP / HITL may shift this load
+
+
+@dataclass(frozen=True)
+class HeaterEnergyDeadline:
+    """One energy delivery deadline for the heater.
+
+    The heater must have delivered ``kwh_required`` kWh of heating energy
+    by hour ``hour:00`` UTC. The window the energy is integrated over
+    runs from the *previous* deadline (circular over 24 h) up to and
+    including ``hour:00``. Example: with ``HEATER_DEADLINES`` = (7, 18),
+    the 07:00 deadline integrates over 18:00 → 07:00 (overnight, 13 h)
+    and the 18:00 deadline integrates over 07:00 → 18:00 (daytime, 11 h).
+    """
+    hour: int                    # UTC hour by which the energy must be delivered
+    kwh_required: float          # kWh required in the window ending at this hour
 
 
 APPLIANCES: dict[str, ApplianceSpec] = {
     "dishwasher": ApplianceSpec(
         name="dishwasher",
         rated_kw=2.5,
-        cycle_slots=8,                 # ~2 hours
+        cycle_slots=8,                 # ~2 hours fixed-shape cycle
         on_power_threshold_w=20.0,
         max_power_w=2500.0,
         bufferable=True,
@@ -95,7 +129,7 @@ APPLIANCES: dict[str, ApplianceSpec] = {
     "washing_machine": ApplianceSpec(
         name="washing_machine",
         rated_kw=2.4,
-        cycle_slots=6,                 # ~1.5 hours
+        cycle_slots=6,                 # ~1.5 hours fixed-shape cycle
         on_power_threshold_w=20.0,
         max_power_w=2400.0,
         bufferable=True,
@@ -103,48 +137,76 @@ APPLIANCES: dict[str, ApplianceSpec] = {
     "ev_charger": ApplianceSpec(
         name="ev_charger",
         rated_kw=7.0,
-        cycle_slots=0,                 # continuous, not cycle-based
+        cycle_slots=0,                 # continuous, MILP-controlled
         on_power_threshold_w=50.0,
         max_power_w=7000.0,
         bufferable=True,
     ),
-    # Heater/AC: 1-hour bufferable cycle with morning and evening comfort deadlines.
-    # The MILP must schedule the cycle to FINISH by each deadline_hour so the
-    # space is warm when the user needs it. Pre-conditioning (starting early) is
-    # always allowed; starting after the deadline is forbidden by a hard constraint.
+    # Heater: continuous variable power, controlled by the MILP, with one
+    # or more energy-delivery deadlines per day (see HEATER_DEADLINES).
+    # The MILP can run the heater at any non-negative power up to rated_kw
+    # at every slot; what matters is the integral over each deadline window.
     "heater": ApplianceSpec(
         name="heater",
         rated_kw=2.0,
-        cycle_slots=4,                 # ~1 hour
+        cycle_slots=0,                 # continuous, no fixed-shape cycle
         on_power_threshold_w=30.0,
         max_power_w=2000.0,
         bufferable=True,
-        deadline_hours=(7, 18),        # pre-heat must finish by 07:00 and 18:00 UTC
     ),
     # Fridge: always-on compressor cycling — not schedulable by the MILP.
     # Adds realistic MinMax background noise to the aggregate trace.
     "fridge": ApplianceSpec(
         name="fridge",
         rated_kw=0.15,
-        cycle_slots=0,                 # continuous compressor, not shift-able
+        cycle_slots=0,                 # always-on baseline
         on_power_threshold_w=10.0,
         max_power_w=150.0,
         bufferable=False,
     ),
 }
 
-# EV daily need (kWh by 07:00 local) — used as MILP comfort constraint.
+
+# --------------------------------------------------------------------------- #
+# EV charging                                                                  #
+# --------------------------------------------------------------------------- #
 EV_DAILY_NEED_KWH = 24.0
-EV_DEADLINE_HOUR = 7             # 07:00 local clock
+EV_DEADLINE_HOUR = 7              # 07:00 UTC — kWh must be delivered by this time
+# Earliest UTC hour at which the EV is plugged in and charging is allowed.
+# Until this hour each day, p_ev[t] is forced to zero by the MILP and by the
+# fallback policy. The scenario simulator schedules the EV plug-in event at
+# exactly this hour to keep the streaming twin and the optimizer in sync.
+EV_AVAILABLE_FROM_HOUR = 20
 
 
 # --------------------------------------------------------------------------- #
-# MPC horizons                                                                #
+# Heater                                                                       #
 # --------------------------------------------------------------------------- #
-# Short horizon drives the receding-horizon MILP; long horizon is used only
-# for deadline-feasibility sanity checks.
-SHORT_HORIZON_SLOTS = 8           # 2 h at 15-min resolution
-LONG_HORIZON_SLOTS = SLOTS_PER_DAY   # 24 h, legacy / sanity check
+# Energy comfort deadlines for the heater. Each entry's ``kwh_required`` must
+# be delivered in the window ending at ``hour:00`` UTC; the window starts at
+# the previous deadline (circular over 24 h). With the defaults below:
+#   * 07:00 deadline → 4 kWh integrated over 18:00 → 07:00 (overnight)
+#   * 18:00 deadline → 2 kWh integrated over 07:00 → 18:00 (daytime)
+HEATER_DEADLINES: tuple[HeaterEnergyDeadline, ...] = (
+    HeaterEnergyDeadline(hour=7, kwh_required=4.0),
+    HeaterEnergyDeadline(hour=18, kwh_required=2.0),
+)
+
+
+# --------------------------------------------------------------------------- #
+# MPC horizon                                                                 #
+# --------------------------------------------------------------------------- #
+# Length of the receding-horizon optimisation in hours. The MILP is re-solved
+# every TRIGGER_RESYNC_MINUTES (or on event triggers), and only the first
+# slot's setpoints are committed before the next replan, so this is a true
+# rolling horizon. 24 h is the default because the heater energy windows can
+# span up to 13 h and we want at least one full window in view at all times.
+HORIZON_HOURS = 24
+SHORT_HORIZON_SLOTS = HORIZON_HOURS * (60 // SLOT_MINUTES)   # 24 h × 4 slots/h = 96
+# Forecast horizon must be at least the optimisation horizon. The seasonal-naive
+# oracle pads to whatever length is requested; the Chronos / GridFM oracles
+# fall back to seasonal if they can't produce 96 slots.
+FORECAST_HORIZON_SLOTS = SHORT_HORIZON_SLOTS
 
 
 # --------------------------------------------------------------------------- #
@@ -161,7 +223,7 @@ TRIGGER_DEADLINE_SAFETY = 1.2
 
 
 # --------------------------------------------------------------------------- #
-# HITL policy tolerances (AUTO vs ASK)                                        #
+# HITL policy tolerances (AUTO vs ASK) and reschedule offers                  #
 # --------------------------------------------------------------------------- #
 HITL_EV_TOLERANCE_KW = 1.5        # EV power change within this → AUTO
 HITL_SHIFT_TOLERANCE_MIN = 15     # tentative-task shift within this → AUTO
@@ -169,6 +231,20 @@ HITL_ASK_SHIFT_MIN = 30           # shift beyond this → ASK
 HITL_COST_BUMP_USD = 0.50         # cost-increasing deadline-guard → ASK
 SLEEP_WINDOW_START = time(22, 0)  # any start crossing into 22–06 → ASK
 SLEEP_WINDOW_END = time(6, 0)
+
+# Reschedule proposals for event-driven cycle appliances (dishwasher,
+# washing machine). When the user starts the appliance, the agent searches
+# for a cheaper start time within the next HITL_RESCHEDULE_WINDOW_HOURS hours
+# and offers the shift to the user iff the savings exceed
+# HITL_RESCHEDULE_MIN_SAVINGS_EUR. In simulation, HITL_AUTO_RESPONSES decides
+# the simulated user's reply per appliance ("accept" runs at proposed time,
+# "decline" runs immediately at the original onset time).
+HITL_RESCHEDULE_WINDOW_HOURS = 2.0
+HITL_RESCHEDULE_MIN_SAVINGS_EUR = 0.10
+HITL_AUTO_RESPONSES: dict[str, str] = {
+    "dishwasher": "accept",
+    "washing_machine": "decline",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +262,12 @@ GRAPH_CHECKPOINT_DB = CACHE_DIR / "graph_state.sqlite"
 RUN_LOG_PATH = CACHE_DIR / "run_log.jsonl"
 
 # Risk-appetite multiplier on the ghost-reservation utility term in the MILP.
+# With dishwasher / washing machine moved out of the MILP into the event-driven
+# HITL path, this knob now only affects the (currently-empty) set of speculative
+# cycle starts the MILP can decide to schedule on its own. It is preserved as a
+# config knob so a future appliance can be re-introduced as a speculative load
+# without re-touching the optimiser. The default value of 0.5 is unchanged from
+# the cycle-aware era.
 RESERVATION_LAMBDA = 0.5
 
 
