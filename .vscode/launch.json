@@ -1,0 +1,73 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "Python: Module (input prompt)",
+      "type": "python",
+      "request": "launch",
+      "module": "${input:pythonModule}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "Pytest: Current File",
+      "type": "python",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "-q",
+        "${file}"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "Pytest: Test at Cursor",
+      "type": "python",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "-q",
+        "${file}",
+        "-k",
+        "${selectedText}"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "Digital Twin: 24h",
+      "type": "python",
+      "request": "launch",
+      "module": "aerogrid.sim.digital_twin",
+      "args": [
+        "--hours",
+        "24"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "pythonModule",
+      "type": "promptString",
+      "description": "Python module to run (example: aerogrid.sim.digital_twin)",
+      "default": "aerogrid.sim.digital_twin"
+    }
+  ]
+}

@@ -15,10 +15,7 @@ default 24 h horizon, HiGHS solves the MIP in tens of milliseconds.
 
 The MIP form lets the optimiser decide *jointly* — within the user-allowed
 shift window — when a cycle should run, which EV power profile to pick, and
-how to spread heater power, all under the house power cap. This eliminates
-the previous failure mode where a price-only reschedule proposal could
-suggest a shift that, when committed, forced the next LP solve to violate
-the cap or pay slack penalties.
+how to spread heater power, all under the house power cap. 
 
 Modelling overview
 ==================
@@ -342,42 +339,27 @@ def _heater_window_slot_masks(
 ) -> dict[int, np.ndarray]:
     """For each heater deadline, return the slot mask of its window ∩ horizon.
 
-    The window for deadline at hour ``h`` is ``(prev_h, h]`` where ``prev_h``
-    is the previous deadline hour, circular over 24 h. A slot belongs to the
-    window iff its start time falls strictly *after* the previous deadline
-    and at or before the current one (modulo 24 h).
-
-    The returned dict is keyed by the deadline's UTC hour and the values are
-    boolean arrays of length ``horizon_slots``.
+    A slot contributes to the deadline whose boundary is the *next* one
+    strictly after that slot (circular over 24 h). This matches the window
+    definition ``(prev_h, h]`` while avoiding heavy datetime gymnastics.
     """
     if not deadlines:
         return {}
     sorted_hours = sorted(d.hour for d in deadlines)
-    # prev_hour[h] is the deadline hour preceding h on a 24 h cycle.
-    prev_hour = {
-        h: sorted_hours[(sorted_hours.index(h) - 1) % len(sorted_hours)]
-        for h in sorted_hours
-    }
     masks: dict[int, np.ndarray] = {h: np.zeros(horizon_slots, dtype=bool) for h in sorted_hours}
+
+    deadline_minutes = {h: int(h * 60) for h in sorted_hours}
     for t in range(horizon_slots):
         slot_t = slot0 + timedelta(minutes=SLOT_MINUTES * t)
-        # Find the next deadline strictly *after* slot_t — that's the window
-        # this slot contributes to.
-        for h in sorted_hours:
-            target = slot_t.replace(hour=h, minute=0, second=0, microsecond=0)
-            if target <= slot_t:
-                target = target + timedelta(days=1)
-            ph = prev_hour[h]
-            prev_target = target - timedelta(days=1)
-            prev_target = prev_target.replace(hour=ph, minute=0, second=0, microsecond=0)
-            # Walk forward by 1 day until prev_target > slot_t makes sense.
-            if prev_target >= target:
-                prev_target = prev_target - timedelta(days=1)
-            # If slot is in (prev_target, target] then this slot contributes
-            # to deadline h.
-            if prev_target < slot_t <= target:
-                masks[h][t] = True
-                break
+        slot_minutes = int(slot_t.hour * 60 + slot_t.minute)
+        # Minutes forward to each deadline on a 24 h ring.
+        # We need "next strictly after", so distance 0 means +24 h.
+        dist = {
+            h: ((deadline_minutes[h] - slot_minutes) % 1440) or 1440
+            for h in sorted_hours
+        }
+        h_star = min(sorted_hours, key=lambda h: dist[h])
+        masks[h_star][t] = True
     return masks
 
 

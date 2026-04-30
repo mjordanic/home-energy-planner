@@ -34,7 +34,7 @@ from aerogrid.config import (
     SLOT_MINUTES,
     HeaterEnergyDeadline,
 )
-from aerogrid.types import Schedule, ScheduledTask
+from aerogrid.types import ApplianceOnset, Schedule, ScheduledTask
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,7 @@ class CommitTracker:
     committed_tasks: list[ScheduledTask] = field(default_factory=list)
     last_ev_deadline_reset: datetime | None = None
     last_heater_deadline_reset: dict[int, datetime] = field(default_factory=dict)
+    _task_start_times: dict[str, datetime] = field(default_factory=dict)
     _task_end_times: dict[str, datetime] = field(default_factory=dict)
     # Track which heater window the current ``now`` lives in, so the heater
     # setpoint is debited from the right window.
@@ -164,6 +165,7 @@ class CommitTracker:
             if end is None or now < end:
                 live.append(task)
             else:
+                self._task_start_times.pop(task.appliance, None)
                 self._task_end_times.pop(task.appliance, None)
                 logger.info(
                     "CommitTracker: task retired appliance=%s cycle_end=%s",
@@ -217,6 +219,8 @@ class CommitTracker:
         slots: int,
         expected_kwh: float,
         start_at: datetime,
+        *,
+        now: datetime | None = None,
     ) -> None:
         """Pin an event-driven cycle (dishwasher / washing machine) starting at ``start_at``.
 
@@ -228,7 +232,23 @@ class CommitTracker:
         the "decline" case is also handled this way).
         """
         if appliance in {t.appliance for t in self.committed_tasks}:
-            logger.debug("CommitTracker.adopt_cycle_start: already committed: %s", appliance)
+            old_start = self._task_start_times.get(appliance)
+            if old_start is not None and now is not None and now < old_start:
+                self._task_start_times[appliance] = start_at
+                self._task_end_times[appliance] = start_at + timedelta(
+                    minutes=SLOT_MINUTES * slots
+                )
+                logger.info(
+                    "CommitTracker: updated deferred appliance=%s start_at=%s ends_at=%s",
+                    appliance,
+                    start_at.isoformat(),
+                    self._task_end_times[appliance].isoformat(),
+                )
+            else:
+                logger.debug(
+                    "CommitTracker.adopt_cycle_start: already committed and started: %s",
+                    appliance,
+                )
             return
         self._commit_task(appliance, slots, expected_kwh, start_at)
 
@@ -249,11 +269,43 @@ class CommitTracker:
         )
         end_time = start_at + timedelta(minutes=SLOT_MINUTES * slots)
         self.committed_tasks.append(committed_task)
+        self._task_start_times[appliance] = start_at
         self._task_end_times[appliance] = end_time
         logger.info(
             "CommitTracker: committed appliance=%s slots=%d expected_kwh=%.2f start_at=%s ends_at=%s",
             appliance, slots, expected_kwh, start_at.isoformat(), end_time.isoformat(),
         )
+
+    def running_committed_tasks(self, now: datetime) -> list[ScheduledTask]:
+        """Return committed cycle tasks that are actively running at ``now``."""
+        out: list[ScheduledTask] = []
+        for task in self.committed_tasks:
+            s = self._task_start_times.get(task.appliance)
+            e = self._task_end_times.get(task.appliance)
+            if s is None or e is None:
+                continue
+            if s <= now < e:
+                out.append(task)
+        return out
+
+    def replannable_onsets(self, now: datetime) -> list[ApplianceOnset]:
+        """Expose deferred (not-yet-started) cycles as synthetic onsets."""
+        out: list[ApplianceOnset] = []
+        for task in self.committed_tasks:
+            s = self._task_start_times.get(task.appliance)
+            e = self._task_end_times.get(task.appliance)
+            if s is None or e is None:
+                continue
+            if now < s:
+                out.append(
+                    ApplianceOnset(
+                        appliance=task.appliance,
+                        timestamp=now,
+                        confidence=1.0,
+                        source="injected",
+                    )
+                )
+        return out
 
     def snapshot(self) -> dict:
         return {

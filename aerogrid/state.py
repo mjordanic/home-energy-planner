@@ -75,6 +75,8 @@ class AeroGridState(TypedDict, total=False):
     decline_plan: Schedule | None
 
     # ---- Monitoring / bookkeeping ---- #
+    # Strategy-local running cost; populated by the OptimizerStrategy when it
+    # builds the graph state. The baseline (and any future strategy) tracks
+    # its own cost outside the LangGraph state.
     cumulative_cost: float
-    cumulative_baseline_cost: float
     event_log: list[dict[str, Any]]

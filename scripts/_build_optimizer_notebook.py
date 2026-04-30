@@ -53,6 +53,7 @@ Each scenario below isolates one aspect of the new formulation.
 | J | Horizon sensitivity (6 / 12 / 24 h) | LP scaling, savings vs. wall-time |
 | K | Heater infeasibility → soft slack | C3 slack absorbs |
 | L | Joint MIP vs price-only reschedule (cap binding) | C5 + C6 |
+| M | Re-nudge before start (+1 h again) | Deferred-cycle replanning |
 """
 
 SETUP = '''\
@@ -73,6 +74,7 @@ except ImportError:
     display = print  # plain-script fallback
 
 from aerogrid.optimizer import solve_receding_horizon
+from aerogrid.commit import CommitTracker
 from aerogrid.config import (
     APPLIANCES, EV_AVAILABLE_FROM_HOUR, EV_DEADLINE_HOUR, HEATER_DEADLINES,
     HOUSE_POWER_CAP_KW, HITL_RESCHEDULE_MIN_SAVINGS_EUR,
@@ -847,6 +849,232 @@ plt.tight_layout()
 plt.show()
 """
 
+# ── scenario M ────────────────────────────────────────────────────────────────
+MD_M = """\
+## Scenario M — Re-nudge before start ("postpone for another hour")
+
+This scenario exercises the new behaviour: **any cycle that has not started
+yet remains replannable**.
+
+Flow:
+
+1. At 20:00 the user starts the dishwasher. The joint solver proposes a +1 h
+   shift (slot 4). We commit that deferred start.
+2. Fifteen minutes later (20:15), a *different* appliance onset appears
+   (washing machine). We now include:
+   - the new onset,
+   - the deferred dishwasher as a synthetic replannable onset
+     (`CommitTracker.replannable_onsets`),
+   and re-solve jointly.
+3. The solver nudges dishwasher again to a later slot (another hour-like move)
+   while also placing washing machine, all under the same cap.
+"""
+
+CODE_M = """\
+now0 = _utc(20, 0)
+spec_d = APPLIANCES["dishwasher"]
+spec_w = APPLIANCES["washing_machine"]
+
+# Step 1 — first onset (dishwasher only): best slot is +1 h.
+prices_M0 = np.full(96, 80.0)
+prices_M0[4:12] = 20.0
+sched_M0 = solve_receding_horizon(
+    now0, prices_M0,
+    horizon_slots=96, remaining_ev_kwh=0.0, house_cap_kw=4.0,
+    pending_cycles=[PendingCycle(
+        appliance="dishwasher",
+        cycle_slots=spec_d.cycle_slots,
+        rated_kw=spec_d.rated_kw,
+        earliest_start_slot=0, latest_start_slot=8,
+    )],
+)
+first_slot = int(sched_M0.cycle_starts["dishwasher"])
+
+commit = CommitTracker()
+cycle_kwh_d = spec_d.rated_kw * spec_d.cycle_slots * SLOT_H
+commit.adopt_cycle_start(
+    appliance="dishwasher",
+    slots=spec_d.cycle_slots,
+    expected_kwh=cycle_kwh_d,
+    start_at=now0 + timedelta(minutes=SLOT_MINUTES * first_slot),
+    now=now0,
+)
+
+# Step 2 — 15 min later, another onset appears (washing machine).
+now1 = now0 + timedelta(minutes=15)
+replannable = commit.replannable_onsets(now1)
+assert any(o.appliance == "dishwasher" for o in replannable), "Deferred dishwasher must stay replannable."
+
+prices_M1 = np.full(96, 80.0)
+prices_M1[3:8] = 200.0
+prices_M1[8:16] = 20.0
+
+sched_M1 = solve_receding_horizon(
+    now1, prices_M1,
+    horizon_slots=96, remaining_ev_kwh=0.0, house_cap_kw=4.0,
+    pending_cycles=[
+        PendingCycle(
+            appliance="dishwasher",
+            cycle_slots=spec_d.cycle_slots,
+            rated_kw=spec_d.rated_kw,
+            earliest_start_slot=0, latest_start_slot=8,
+        ),
+        PendingCycle(
+            appliance="washing_machine",
+            cycle_slots=spec_w.cycle_slots,
+            rated_kw=spec_w.rated_kw,
+            earliest_start_slot=0, latest_start_slot=8,
+        ),
+    ],
+)
+
+second_slot = int(sched_M1.cycle_starts["dishwasher"])
+wm_slot = int(sched_M1.cycle_starts["washing_machine"])
+
+print("First plan (20:00):")
+print(f"  dishwasher slot = {first_slot}  (+{first_slot*SLOT_H:.2f} h)")
+print("Second plan (20:15) with new washing-machine onset:")
+print(f"  dishwasher slot = {second_slot}  (+{second_slot*SLOT_H:.2f} h from now)")
+print(f"  washing machine slot = {wm_slot}  (+{wm_slot*SLOT_H:.2f} h from now)")
+print(f"  dishwasher additional nudge = {(second_slot - (first_slot-1))*SLOT_H:.2f} h")
+
+# From 20:15, the original +1 h dishwasher start corresponds to slot 3.
+orig_slot_from_now1 = first_slot - 1
+assert second_slot >= orig_slot_from_now1 + 4, "Expected dishwasher to be nudged by ~another hour."
+
+# Visualise first and second plans side-by-side.
+T = sched_M1.horizon_slots
+hrs = np.arange(T) * SLOT_H
+
+dish_first = np.zeros(T); dish_first[first_slot:first_slot + spec_d.cycle_slots] = spec_d.rated_kw
+dish_second = np.zeros(T); dish_second[second_slot:second_slot + spec_d.cycle_slots] = spec_d.rated_kw
+wash_second = np.zeros(T); wash_second[wm_slot:wm_slot + spec_w.cycle_slots] = spec_w.rated_kw
+
+fig_M_plans, axes = plt.subplots(1, 2, figsize=(13.5, 4.6), sharey=True)
+for ax, title, ev_arr, heat_arr, dish_arr, wash_arr, mark_old in [
+    (
+        axes[0],
+        f"First plan @20:00 (dishwasher slot {first_slot})",
+        np.asarray(sched_M0.ev_power_kw),
+        np.asarray(sched_M0.heater_power_kw),
+        dish_first,
+        np.zeros(T),
+        None,
+    ),
+    (
+        axes[1],
+        f"Second plan @20:15 (dish {second_slot}, wash {wm_slot})",
+        np.asarray(sched_M1.ev_power_kw),
+        np.asarray(sched_M1.heater_power_kw),
+        dish_second,
+        wash_second,
+        orig_slot_from_now1 * SLOT_H,
+    ),
+]:
+    ax.bar(hrs, ev_arr, width=SLOT_H*0.9, color=_PALETTE["ev_charger"], alpha=0.85, label="EV", align="edge")
+    ax.bar(hrs, heat_arr, width=SLOT_H*0.9, bottom=ev_arr, color=_PALETTE["heater"], alpha=0.8, label="heater", align="edge")
+    ax.bar(hrs, wash_arr, width=SLOT_H*0.9, bottom=ev_arr+heat_arr, color=_PALETTE["washing_machine"], alpha=0.75, label="washing_machine", align="edge")
+    ax.bar(hrs, dish_arr, width=SLOT_H*0.9, bottom=ev_arr+heat_arr+wash_arr, color=_PALETTE["dishwasher"], hatch="//", alpha=0.75, label="dishwasher", align="edge")
+    ax.axhline(4.0, color="black", ls="--", lw=1.1, label="cap 4.0 kW")
+    if mark_old is not None:
+        ax.axvline(mark_old, color="red", ls=":", lw=1.2, label="old dishwasher start")
+    ax.set_xlim(0, 4)
+    ax.set_ylim(0, 6.5)
+    ax.set_xlabel("hour from plan timestamp")
+    ax.set_title(title, fontsize=9.5)
+axes[0].set_ylabel("load (kW)")
+axes[1].legend(fontsize=7.5, loc="upper right")
+plt.tight_layout()
+plt.show()
+
+# Timeline view (requested): x = elapsed replan/detection time,
+# y = elapsed scheduled start time. Onset detections lie on y=x.
+t0 = now0
+t_event_dish = now0
+t_event_wash = now1
+t_plan1_dish = now0 + timedelta(minutes=SLOT_MINUTES * first_slot)
+t_plan2_dish = now1 + timedelta(minutes=SLOT_MINUTES * second_slot)
+t_plan2_wash = now1 + timedelta(minutes=SLOT_MINUTES * wm_slot)
+
+def _eh(dt):
+    return (dt - t0).total_seconds() / 3600.0
+
+fig_M_timeline, ax = plt.subplots(figsize=(8.2, 6.2))
+
+# Reference diagonal y=x: "detected now".
+grid_max_h = max(_eh(t_plan2_dish), _eh(t_plan1_dish), _eh(t_plan2_wash), 2.0) + 0.25
+ax.plot([0, grid_max_h], [0, grid_max_h], color="#888888", ls="--", lw=1.0, label="y = x (detected now)")
+
+# Onset detections (special marker, on the diagonal).
+ax.scatter(
+    [_eh(t_event_dish), _eh(t_event_wash)],
+    [_eh(t_event_dish), _eh(t_event_wash)],
+    color=[_PALETTE["dishwasher"], _PALETTE["washing_machine"]],
+    marker="X", s=90, zorder=4, label="onset detected",
+)
+
+# Planned starts from replan @20:00 and @20:15.
+ax.scatter(
+    [_eh(now0)],
+    [_eh(t_plan1_dish)],
+    color=_PALETTE["dishwasher"], marker="o", s=85, zorder=5, label="dish plan @20:00",
+)
+ax.scatter(
+    [_eh(now1), _eh(now1)],
+    [_eh(t_plan2_dish), _eh(t_plan2_wash)],
+    color=[_PALETTE["dishwasher"], _PALETTE["washing_machine"]],
+    marker="o", s=85, zorder=5, label="plan @20:15",
+)
+
+# Connect same-appliance planned points to show re-nudge slope.
+ax.plot(
+    [_eh(now0), _eh(now1)],
+    [_eh(t_plan1_dish), _eh(t_plan2_dish)],
+    color=_PALETTE["dishwasher"], alpha=0.7, lw=1.4,
+)
+
+ax.annotate("dish onset", (_eh(t_event_dish), _eh(t_event_dish)), xytext=(6, 8), textcoords="offset points", fontsize=8)
+ax.annotate("wash onset", (_eh(t_event_wash), _eh(t_event_wash)), xytext=(6, 8), textcoords="offset points", fontsize=8)
+ax.annotate("dish start from plan@20:00", (_eh(now0), _eh(t_plan1_dish)), xytext=(6, 8), textcoords="offset points", fontsize=8)
+ax.annotate("dish start from plan@20:15", (_eh(now1), _eh(t_plan2_dish)), xytext=(6, 8), textcoords="offset points", fontsize=8)
+ax.annotate("wash start from plan@20:15", (_eh(now1), _eh(t_plan2_wash)), xytext=(6, -12), textcoords="offset points", fontsize=8)
+
+ax.set_xlim(-0.02, grid_max_h)
+ax.set_ylim(-0.02, grid_max_h)
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlabel("elapsed time from 20:00 (h) — when event detected / plan computed")
+ax.set_ylabel("elapsed time from 20:00 (h) — scheduled onset time")
+ax.set_title("Scenario M timeline — x: plan time, y: scheduled onset")
+ax.grid(True, alpha=0.25)
+ax.legend(fontsize=8, loc="upper left")
+plt.tight_layout()
+plt.show()
+
+# Visualise the second joint plan (detailed stack, same as before).
+T = sched_M1.horizon_slots
+hrs = np.arange(T) * SLOT_H
+ev = np.asarray(sched_M1.ev_power_kw)
+heat = np.asarray(sched_M1.heater_power_kw)
+dish = np.zeros(T); dish[second_slot:second_slot + spec_d.cycle_slots] = spec_d.rated_kw
+wash = np.zeros(T); wash[wm_slot:wm_slot + spec_w.cycle_slots] = spec_w.rated_kw
+
+fig_M, ax = plt.subplots(figsize=(13, 4.8))
+ax.bar(hrs, ev, width=SLOT_H*0.9, color=_PALETTE["ev_charger"], alpha=0.85, label="EV", align="edge")
+ax.bar(hrs, heat, width=SLOT_H*0.9, bottom=ev, color=_PALETTE["heater"], alpha=0.8, label="heater", align="edge")
+ax.bar(hrs, wash, width=SLOT_H*0.9, bottom=ev+heat, color=_PALETTE["washing_machine"], alpha=0.75, label="washing_machine", align="edge")
+ax.bar(hrs, dish, width=SLOT_H*0.9, bottom=ev+heat+wash, color=_PALETTE["dishwasher"], hatch="//", alpha=0.75, label="dishwasher", align="edge")
+ax.axhline(4.0, color="black", ls="--", lw=1.2, label="cap 4.0 kW")
+ax.axvline(orig_slot_from_now1 * SLOT_H, color="red", ls=":", lw=1.2, label="old dishwasher start")
+ax.set_xlim(0, 4)
+ax.set_ylim(0, 6.5)
+ax.set_xlabel("hour from 20:15")
+ax.set_ylabel("load (kW)")
+ax.set_title("Scenario M — deferred dishwasher gets re-nudged after a new onset")
+ax.legend(fontsize=8, loc="upper right")
+plt.tight_layout()
+plt.show()
+"""
+
 # ── summary ───────────────────────────────────────────────────────────────────
 MD_SUMMARY = """\
 ## Summary
@@ -865,6 +1093,7 @@ MD_SUMMARY = """\
 | J | Horizon sensitivity | 24 h LP is only ~3× slower than 6 h, savings improve with horizon |
 | K | Heater infeasibility | Slack absorbs the impossible 100 kWh ask, LP stays optimal |
 | L | Joint MIP vs price-only reschedule | Joint solve avoids cap-induced re-shuffle, lowers plan cost |
+| M | Re-nudge before start | Deferred dishwasher is replanned after new onset (moves again) |
 
 All scenarios are deterministic given their seeds — rerunning produces identical results.
 """
@@ -896,6 +1125,8 @@ cells = [
     code(CODE_K),
     md(MD_L),
     code(CODE_L),
+    md(MD_M),
+    code(CODE_M),
     md(MD_SUMMARY),
 ]
 

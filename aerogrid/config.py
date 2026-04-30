@@ -260,6 +260,29 @@ BEHAVIORAL_PREDICTOR_IMPL = "hybrid"
 # --------------------------------------------------------------------------- #
 GRAPH_CHECKPOINT_DB = CACHE_DIR / "graph_state.sqlite"
 RUN_LOG_PATH = CACHE_DIR / "run_log.jsonl"
+# Per-15-min slot comparison between baseline and optimizer (strategies.py).
+SLOT_LOG_PATH = CACHE_DIR / "slot_log.parquet"
+# Per-event decision log at 1-second resolution for both strategies.
+EVENT_LOG_PATH = CACHE_DIR / "event_log.parquet"
+
+
+# --------------------------------------------------------------------------- #
+# Simulation injections (digital twin only)                                   #
+# --------------------------------------------------------------------------- #
+# Declarative knobs for deterministic stress tests.
+#
+# INJECTED_APPLIANCE_ONSETS:
+#   Sequence of (appliance_name, timestamp_utc) pairs. Each pair schedules a
+#   synthetic onset in ScenarioStreamer; the event then flows through the same
+#   trigger/graph path as naturally detected onsets.
+#
+# INJECTED_PRICE_SPIKES:
+#   Sequence of (timestamp_utc, delta_eur_per_mwh) pairs. At each timestamp's
+#   15-minute slot, the price server adds the delta on top of realized price.
+#
+# Leave either list empty to disable that injection path entirely.
+INJECTED_APPLIANCE_ONSETS: tuple[tuple[str, datetime], ...] = ()
+INJECTED_PRICE_SPIKES: tuple[tuple[datetime, float], ...] = ()
 
 # Risk-appetite multiplier on the ghost-reservation utility term in the MILP.
 # With dishwasher / washing machine moved out of the MILP into the event-driven

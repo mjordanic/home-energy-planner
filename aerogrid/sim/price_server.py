@@ -25,16 +25,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PriceServer:
     prices: pd.DataFrame = field(default_factory=load_price_history)
-    spike_at: datetime | None = None
-    spike_magnitude: float = 150.0          # $/MWh added
+    spike_events: list[tuple[datetime, float]] = field(default_factory=list)
 
     def __post_init__(self):
         """Sort the price DataFrame by timestamp on construction."""
         self.prices = self.prices.sort_values("timestamp").reset_index(drop=True)
         logger.info(
-            "PriceServer: initialised with %d price rows spike_at=%s",
+            "PriceServer: initialised with %d price rows spike_events=%d",
             len(self.prices),
-            self.spike_at.isoformat() if self.spike_at else "None",
+            len(self.spike_events),
         )
 
     def _slot_for(self, now: datetime) -> datetime:
@@ -54,11 +53,15 @@ class PriceServer:
             logger.warning("PriceServer.realized: no price row for slot=%s", slot.isoformat())
             return None
         price = float(row["lbmp"].iloc[0])
-        if self.spike_at is not None and self._slot_for(self.spike_at) == slot:
+        delta = 0.0
+        for at, magnitude in self.spike_events:
+            if self._slot_for(at) == slot:
+                delta += float(magnitude)
+        if delta != 0.0:
             logger.info(
-                "PriceServer.realized: spike applied at slot=%s +%.2f → price=%.2f",
-                slot.isoformat(), self.spike_magnitude, price + self.spike_magnitude,
+                "PriceServer.realized: spike(s) applied at slot=%s +%.2f → price=%.2f",
+                slot.isoformat(), delta, price + delta,
             )
-            price += self.spike_magnitude
+            price += delta
         logger.debug("PriceServer.realized: slot=%s price=%.2f", slot.isoformat(), price)
         return price

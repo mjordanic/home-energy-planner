@@ -33,36 +33,96 @@ changes.
 
 ## Architecture
 
-Three loops at three rates:
+The digital twin streams the same 1 Hz event sequence into **N independent
+strategy agents**.  Each strategy is a self-contained agent that owns ALL of
+its perception and planning machinery — its own NILM disaggregator, onset
+detectors, behavioural predictor, price oracle, MPC graph, and so on.
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│ Inner loop  (1 Hz, every sample)                               │
-│   ScenarioStreamer.iter_samples() ─▶ Sample(t, p_mains, …)     │
-│       ├─▶ RollingDisaggregator.append / infer_latest           │
-│       │   (ground-truth lookup; swap for real NILM model)      │
-│       ├─▶ OnsetDetector.update  (per appliance)                │
-│       ├─▶ CommitTracker.tick    (decrement EV kWh, retire ...) │
-│       └─▶ TriggerManager.evaluate → ReplanTrigger?             │
-└────────────────────┬───────────────────────────────────────────┘
-                     │ fires only when a trigger hits
+┌────────────────────────────────────────────────────────────────────────┐
+│ Digital twin (orchestrator) — owns ONLY the simulation environment     │
+│   ScenarioStreamer.iter_samples() ─▶ Sample(t, p_mains_w, price)       │
+│   PriceServer.realized() ─▶ realized €/MWh at slot boundaries          │
+│   streamer.consume_injected_onsets(now) ─▶ synthetic stress-test events│
+│                                                                        │
+│   For every 1 Hz sample:                                               │
+│     1. pull injected onsets due now                                    │
+│     2. cross-strategy gating: drop any injected onset whose appliance  │
+│        is still pending in ANY strategy (prevents unrealistic          │
+│        double-loading across strategies' divergent schedules)          │
+│     3. for every strategy s:                                           │
+│            s.tick(sample, gated_injected_onsets, dt_s=1.0)             │
+│     4. at slot boundaries: s.get_slot_record(now, price) → wide row    │
+│     5. flush events from every strategy into the shared event log      │
+└────────────────────┬───────────────────────────────────────────────────┘
+                     │ same (sample, gated_injected_onsets) tuple
                      ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ Outer loop (LangGraph, event-driven)                               │
-│   forecast_price ─▶ predict_behavior ─▶ optimize                   │
-│                                       │                            │
-│                                       ▼                            │
-│                            propose_reschedule  (cycle onsets only) │
-│                                       │                            │
-│                                       ▼                            │
-│                              hitl_gate                             │
-│                                       │                            │
-│                       auto ──▶ commit_plan ◀── ask ── interrupt    │
-└────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│ Each Strategy — autonomous agent, owns its own machinery               │
+│                                                                        │
+│   BaselineStrategy            OptimizerStrategy                        │
+│   ─────────────────           ──────────────────                       │
+│   no NILM                     own NILM (built in __init__)             │
+│   no oracle                   own onset detectors                      │
+│   no predictor                own price oracle                         │
+│   no graph                    own behavioural predictor                │
+│   no CommitTracker            own compiled LangGraph                   │
+│   no TriggerManager           own CommitTracker                        │
+│                               own TriggerManager                       │
+│                                                                        │
+│   parameter-free              constructor builds everything from       │
+│   constructor                 (price_history_provider, oracle_impl,    │
+│                                horizon_slots, scenario_dir, …)         │
+│                                                                        │
+│   ASAP policy:                MPC slow path, fires on TriggerManager:  │
+│   - injected cycle onset      forecast_price ─▶ predict_behavior       │
+│       → start now                        ─▶ optimize                   │
+│   - EV: rated power until                ─▶ propose_reschedule         │
+│         full                             ─▶ hitl_gate ─▶ commit_plan   │
+│   - heater: rated power                                                │
+│         until kWh met                                                  │
+└────────────────────────────────────────────────────────────────────────┘
 ```
+
+Two strategies in the same run can perfectly well use different NILM
+weights or different forecasters — they're fully independent agents that
+happen to be evaluated against the same realized prices.
+
+Outputs (written to `data/cache/`):
+
+| file | resolution | contents |
+|---|---|---|
+| `slot_log.parquet` | 15 min | one row per slot; `<strategy>_*` columns for every strategy's power profile + cumulative cost; stream-level columns for permitted/suppressed injected onsets |
+| `event_log.parquet` | 1 second | one row per decision; uniform schema; `strategy="stream"` for digital-twin-level events (`onset_permitted` / `onset_suppressed`) |
+| `run_log.jsonl` | per replan | OptimizerStrategy's full plan detail (HITL decisions, reschedule proposals, full power profiles) |
 
 Key design choices:
 
+- **Per-strategy ownership of perception and planning.** NILM disaggregation,
+  behavioural prediction, price forecasting, and the MPC graph are NOT shared
+  across strategies — each strategy builds its own copies inside its own
+  constructor. The `BaselineStrategy` is deliberately parameter-free with no
+  perception machinery at all (just time-driven setpoints + immediate cycle
+  starts on injected onsets); the `OptimizerStrategy` builds NILM, oracle,
+  predictor and the LangGraph from a few high-level constructor args. This
+  lets you run multiple optimizer instances side by side with different
+  oracles in the same simulation.
+- **Baseline reacts only to injected onsets.** Because `BaselineStrategy`
+  has no NILM, it cannot perceive natural cycle onsets in the mains signal.
+  The demo scenarios drive cycles via injected onsets so this gives a clean
+  comparison; if you need a baseline that also perceives natural onsets,
+  write a custom `Strategy` subclass and give it its own NILM.
+- **The digital twin owns only what is genuinely shared:** the mains-power
+  stream, the realized-price server (physical reality, not a forecast), the
+  injected-onset queue, and cross-strategy onset gating. Anyone can add a
+  new strategy by implementing the four abstract methods on `Strategy`.
+- **Cross-strategy onset gating.** When two strategies disagree (e.g. the
+  optimizer deferred a wash 2 h forward but the baseline ran it immediately
+  and finished), an injected onset for the same appliance arriving while
+  *any* strategy still has it pending is suppressed by the digital twin.
+  Natural onsets perceived by each strategy's NILM are observations of
+  reality and are NOT gated — different NILM models may legitimately
+  disagree on whether a small power signature was a cycle start.
 - **Streaming input.** The agent sees every 1 Hz meter reading; it is free to
   react at any moment. Replans are event-driven, not clock-driven.
 - **Receding-horizon MPC.** The optimizer is a *pure linear program* (no
@@ -191,12 +251,23 @@ washing machine), the LangGraph node `propose_reschedule`:
 
 ### Baseline cost and reported savings
 
-`_baseline_cost` evaluates a *price-unaware* schedule: EV charges ASAP
-from the start of its availability window; the heater spreads its
-required kWh evenly across each window. The LP's `expected_cost` is
-compared to this baseline to produce the savings ratio `(baseline −
-expected) / baseline`, which is the headline metric in the demonstration
-notebooks and in `Schedule.savings()`.
+There are **two** baseline-vs-optimizer comparisons in the codebase, used
+for different purposes:
+
+1. **Per-replan estimate** (inside `optimizer.py`). `_baseline_cost`
+   evaluates a *price-unaware* schedule over the same horizon as the LP:
+   EV charges ASAP from the start of its availability window; the heater
+   runs at rated power until each window's kWh requirement is met. The
+   LP's `expected_cost` is compared to this baseline to produce the savings
+   ratio reported on the `Schedule` object after every replan.
+
+2. **Simulation-wide comparison** (`BaselineStrategy` in
+   `aerogrid/sim/strategies.py`). The actual baseline savings reported by
+   the digital twin come from running a `BaselineStrategy` agent in
+   parallel with the `OptimizerStrategy` over the exact same event stream
+   and realized prices. The two strategies' cumulative costs are
+   directly comparable because they're computed from the same prices and
+   reflect the same gated onset stream — no post-hoc reconstruction.
 
 ### Reproducibility
 
@@ -236,13 +307,17 @@ uv sync --extra dev
 .venv/bin/python -m pytest -q
 
 # 5) streaming digital-twin run over the 14-day test window
+#    Writes data/cache/{slot_log.parquet, event_log.parquet, run_log.jsonl}.
 .venv/bin/python -m aerogrid.sim.digital_twin
 
-# 5b) shorter smoke run with a planted price spike
-.venv/bin/python -m aerogrid.sim.digital_twin --hours 48 --inject-spike
+# 5b) shorter smoke run, 24 hours
+.venv/bin/python -m aerogrid.sim.digital_twin --hours 24
 
 # 5c) override the optimisation horizon (default 24 h) and silence the file log
 .venv/bin/python -m aerogrid.sim.digital_twin --hours 8 --horizon-hours 6 --no-log-file
+
+# 5d) try a different price oracle on the OptimizerStrategy
+.venv/bin/python -m aerogrid.sim.digital_twin --hours 24 --price-impl chronos
 
 # 6) notebooks (scenario EDA, optimizer, end-to-end, intervention demo)
 .venv/bin/python -m jupyter lab notebooks/
@@ -262,7 +337,8 @@ produced each forecast.
 
 ## Plugging in a real NILM model
 
-The `aerogrid/nilm/` package is designed as a plug-in point:
+NILM lives inside `OptimizerStrategy` (the only built-in strategy that
+needs it). To swap a real model in:
 
 1. **Subclass `DisaggregatorBase`** in `aerogrid/nilm/disaggregator.py` —
    implement `appliances()` and `disaggregate(power_1hz)`.
@@ -270,12 +346,33 @@ The `aerogrid/nilm/` package is designed as a plug-in point:
    per-appliance model interface.
 3. **Add training logic** in `aerogrid/nilm/train.py` (currently a
    placeholder).
-4. Update `aerogrid/sim/digital_twin.py` to instantiate your disaggregator
-   instead of the default `Disaggregator.from_scenario()`.
+4. In `aerogrid/sim/strategies.py`, replace the call to
+   `Disaggregator.from_scenario(...)` inside `_build_nilm_components` with
+   your own constructor. Alternatively, subclass `OptimizerStrategy` and
+   override the NILM stack in `__init__`.
 
 The `OnsetDetector` (threshold + debounce) and `power_to_onsets()` helper
 are independent of the NILM model and will work with any disaggregator
 that outputs per-appliance power traces.
+
+## Adding a new strategy
+
+The digital twin's run loop is policy-agnostic — it just calls
+`tick / has_pending_appliance / get_slot_record / flush_events` on each
+agent. To add a new scheduling policy:
+
+1. Subclass `aerogrid.sim.strategies.Strategy`, implement the four
+   abstract methods (`tick`, `has_pending_appliance`, `get_slot_record`,
+   plus optional `close` / `summary`).
+2. Construct an instance of your strategy in
+   `aerogrid/sim/digital_twin.py`'s `main()` and append it to the
+   `strategies` list. Each strategy's slot-log columns get auto-prefixed
+   with `strategy.name`, and event-log rows are tagged with the same
+   `strategy` field.
+
+`BaselineStrategy` and `OptimizerStrategy` in `strategies.py` are
+reference implementations — minimal naive ASAP and full MPC + LangGraph,
+respectively.
 
 ## Repo layout
 
@@ -318,8 +415,15 @@ aerogrid/                     core library
                               add_onset() / consume_injected_onsets() for
                               programmatically injecting test onsets
     price_server.py           price parquet feed + optional spike injection
-    digital_twin.py           the 1 Hz sample loop + graph invocation
-                              (--horizon-hours overrides HORIZON_HOURS)
+    strategies.py             Strategy ABC + BaselineStrategy +
+                              OptimizerStrategy (each a self-contained
+                              agent; OptimizerStrategy owns its NILM,
+                              oracle, predictor, CommitTracker, TriggerManager,
+                              and compiled LangGraph)
+    digital_twin.py           thin orchestrator: streamer + price server +
+                              cross-strategy onset gating + slot/event-log
+                              writers. No NILM, oracle, predictor or graph
+                              live here — they're per-strategy.
 
 scripts/                      one-shot data jobs
   generate_scenario.py        scenario → parquet + MANIFEST.json
