@@ -273,7 +273,111 @@ EVENT_LOG_PATH = CACHE_DIR / "event_log.parquet"
 #   15-minute slot, the price server adds the delta on top of realized price.
 #
 # Leave either list empty to disable that input.
-APPLIANCE_ONSETS: tuple[tuple[str, datetime], ...] = ()
+#
+# Onset times are UTC.  The simulation window is Apr 3–18 2026, DE-LU (CEST =
+# UTC+2), so e.g. German 19:30 → UTC 17:30.  Dishwasher onsets cluster after
+# meals; washing machine onsets spread across mornings and afternoons.
+def _onset(day: int, app: str, h: int, m: int) -> tuple[str, datetime]:
+    return (app, datetime(2026, 4, day, h, m, tzinfo=timezone.utc))
+
+
+_DW = "dishwasher"
+_WM = "washing_machine"
+
+APPLIANCE_ONSETS: tuple[tuple[str, datetime], ...] = (
+    # --- Apr 3 (Mon) ---
+    _onset(3, _DW,  9, 15),   # after breakfast
+    _onset(3, _DW, 17, 30),   # after dinner
+    _onset(3, _WM,  7, 30),   # morning load
+    _onset(3, _WM, 13, 45),   # midday load
+    # --- Apr 4 (Tue) ---
+    _onset(4, _DW, 10, 45),   # after late breakfast
+    _onset(4, _DW, 18, 00),   # after dinner
+    _onset(4, _DW, 20, 15),   # late-evening top-up
+    _onset(4, _WM,  8, 00),
+    _onset(4, _WM, 14, 15),
+    # --- Apr 5 (Wed) ---
+    _onset(5, _DW, 11, 30),
+    _onset(5, _DW, 19, 15),
+    _onset(5, _WM,  6, 45),   # early load
+    _onset(5, _WM, 15, 30),
+    _onset(5, _WM, 17, 00),
+    # --- Apr 6 (Thu) ---
+    _onset(6, _DW, 10, 00),
+    _onset(6, _DW, 17, 45),
+    _onset(6, _DW, 20, 30),
+    _onset(6, _WM,  7, 15),
+    _onset(6, _WM, 14, 45),
+    # --- Apr 7 (Fri) ---
+    _onset(7, _DW, 12, 00),
+    _onset(7, _DW, 18, 45),
+    _onset(7, _WM,  8, 30),
+    _onset(7, _WM, 16, 00),
+    # --- Apr 8 (Sat) weekend: more loads ---
+    _onset(8, _DW,  9, 30),
+    _onset(8, _DW, 13, 00),
+    _onset(8, _DW, 18, 30),
+    _onset(8, _WM,  8, 00),
+    _onset(8, _WM, 11, 45),
+    _onset(8, _WM, 15, 15),
+    # --- Apr 9 (Sun) weekend ---
+    _onset(9, _DW, 11, 15),
+    _onset(9, _DW, 19, 00),
+    _onset(9, _WM,  9, 00),
+    _onset(9, _WM, 13, 30),
+    _onset(9, _WM, 16, 45),
+    # --- Apr 10 (Mon) ---
+    _onset(10, _DW, 10, 30),
+    _onset(10, _DW, 18, 15),
+    _onset(10, _WM,  7, 45),
+    _onset(10, _WM, 14, 00),
+    # --- Apr 11 (Tue) ---
+    _onset(11, _DW, 12, 15),
+    _onset(11, _DW, 17, 15),
+    _onset(11, _DW, 20, 45),
+    _onset(11, _WM,  8, 15),
+    _onset(11, _WM, 15, 00),
+    # --- Apr 12 (Wed) ---
+    _onset(12, _DW,  9, 45),
+    _onset(12, _DW, 19, 30),
+    _onset(12, _WM,  6, 30),
+    _onset(12, _WM, 11, 30),
+    _onset(12, _WM, 16, 30),
+    # --- Apr 13 (Thu) ---
+    _onset(13, _DW, 11, 00),
+    _onset(13, _DW, 18, 00),
+    _onset(13, _WM,  7, 30),
+    _onset(13, _WM, 13, 15),
+    # --- Apr 14 (Fri) ---
+    _onset(14, _DW, 10, 15),
+    _onset(14, _DW, 17, 00),
+    _onset(14, _DW, 20, 00),
+    _onset(14, _WM,  8, 45),
+    _onset(14, _WM, 14, 30),
+    # --- Apr 15 (Sat) weekend ---
+    _onset(15, _DW,  9, 00),
+    _onset(15, _DW, 13, 45),
+    _onset(15, _DW, 19, 45),
+    _onset(15, _WM,  7, 00),
+    _onset(15, _WM, 11, 15),
+    _onset(15, _WM, 16, 15),
+    # --- Apr 16 (Sun) weekend ---
+    _onset(16, _DW, 12, 30),
+    _onset(16, _DW, 18, 45),
+    _onset(16, _WM,  9, 15),
+    _onset(16, _WM, 14, 00),
+    _onset(16, _WM, 17, 30),
+    # --- Apr 17 (Mon) ---
+    _onset(17, _DW, 10, 45),
+    _onset(17, _DW, 18, 30),
+    _onset(17, _WM,  7, 00),
+    _onset(17, _WM, 13, 00),
+    # --- Apr 18 (Tue) ---
+    _onset(18, _DW, 11, 45),
+    _onset(18, _DW, 17, 15),
+    _onset(18, _WM,  8, 00),
+    _onset(18, _WM, 15, 45),
+)
 INJECTED_PRICE_SPIKES: tuple[tuple[datetime, float], ...] = ()
 
 
