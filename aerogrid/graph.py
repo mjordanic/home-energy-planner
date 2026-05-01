@@ -1,16 +1,13 @@
 """LangGraph orchestration for the outer (MPC) loop.
 
 The inner 1 Hz sample loop lives in :mod:`aerogrid.sim.digital_twin` — it
-runs the disaggregator, onset detector, and commit tracker every sample,
-and only invokes this graph when :class:`aerogrid.triggers.TriggerManager`
-fires. Keeping the graph to the "slow path" keeps it small, testable, and
-fast enough to run many times per simulated hour.
+runs the commit tracker every sample, and only invokes this graph when
+:class:`aerogrid.triggers.TriggerManager` fires. Keeping the graph to the
+"slow path" keeps it small, testable, and fast enough to run many times
+per simulated hour.
 
 Nodes (in order):
   forecast_price       — short-horizon price quantile forecast
-  predict_behavior     — per-appliance onset probabilities over the horizon
-                         (kept for telemetry / future predictive features;
-                         no longer drives the optimiser).
   optimize             — receding-horizon LP: continuous EV + heater plus
                          per-window heater energy deadlines, with
                          committed-task pinning and soft-slack fallback.
@@ -41,7 +38,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from aerogrid.behavioral_predictor import BehavioralPredictor
 from aerogrid.config import (
     APPLIANCES,
     HITL_RESCHEDULE_MIN_SAVINGS_EUR,
@@ -207,7 +203,6 @@ def _pending_cycles_from_onsets(
 
 def build_graph(
     price_oracle: PriceOracle,
-    predictor: BehavioralPredictor,
     price_history_provider,                  # callable(now) -> pd.DataFrame
     *,
     horizon_slots: int = SHORT_HORIZON_SLOTS,
@@ -218,12 +213,11 @@ def build_graph(
 
     The compiled graph runs::
 
-        forecast_price → predict_behavior → optimize → propose_reschedule
+        forecast_price → optimize → propose_reschedule
                        → hitl_gate → (commit_plan | END)
 
     Args:
         price_oracle: Forecaster implementing :class:`PriceOracle`.
-        predictor: Onset predictor implementing :class:`BehavioralPredictor`.
         price_history_provider: Callable ``(now: datetime) -> pd.DataFrame``
             returning the price context for the oracle (past rows only).
         horizon_slots: Number of 15-min slots in the receding horizon.
@@ -262,27 +256,6 @@ def build_graph(
             horizon_slots,
         )
         return {"price_forecast": fc}
-
-    def n_predict_behavior(state: AeroGridState) -> dict:
-        """Predict per-appliance onset probabilities for the upcoming horizon.
-
-        Kept for telemetry and future predictive features. The onset
-        probabilities no longer drive the optimiser (cycle starts are
-        event-driven now), but they remain useful for "what does the model
-        think the user typically does?" plots in the notebooks.
-        """
-        now = state["now"]
-        logger.info(
-            "graph.n_predict_behavior: now=%s predictor=%s horizon=%d",
-            now.isoformat(), type(predictor).__name__, horizon_slots,
-        )
-        probs = predictor.predict_all(now, horizon_slots)
-        for app, p in probs.items():
-            logger.debug(
-                "graph.n_predict_behavior: %s max_prob=%.4f mean_prob=%.4f",
-                app, float(p.max()), float(p.mean()),
-            )
-        return {"onset_probs": probs}
 
     def n_optimize(state: AeroGridState) -> dict:
         """Solve the receding-horizon program and append the result to the event log.
@@ -605,15 +578,13 @@ def build_graph(
 
     builder = StateGraph(AeroGridState)
     builder.add_node("forecast_price", n_forecast_price)
-    builder.add_node("predict_behavior", n_predict_behavior)
     builder.add_node("optimize", n_optimize)
     builder.add_node("propose_reschedule", n_propose_reschedule)
     builder.add_node("hitl_gate", n_hitl_gate)
     builder.add_node("commit_plan", n_commit_plan)
 
     builder.add_edge(START, "forecast_price")
-    builder.add_edge("forecast_price", "predict_behavior")
-    builder.add_edge("predict_behavior", "optimize")
+    builder.add_edge("forecast_price", "optimize")
     builder.add_edge("optimize", "propose_reschedule")
     builder.add_edge("propose_reschedule", "hitl_gate")
     builder.add_conditional_edges(
@@ -623,9 +594,8 @@ def build_graph(
 
     checkpointer = InMemorySaver(serde=_PickleSerializer())
     logger.info(
-        "build_graph: graph built horizon=%d auto_confirm=%s oracle=%s predictor=%s",
-        horizon_slots, auto_confirm,
-        type(price_oracle).__name__, type(predictor).__name__,
+        "build_graph: graph built horizon=%d auto_confirm=%s oracle=%s",
+        horizon_slots, auto_confirm, type(price_oracle).__name__,
     )
     return builder, checkpointer
 

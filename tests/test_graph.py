@@ -8,7 +8,6 @@ import pandas as pd
 import pytest
 from langgraph.types import Command
 
-from aerogrid.behavioral_predictor import HybridBehavioralPredictor
 from aerogrid.graph import build_graph, make_thread_id
 from aerogrid.price_oracle import SeasonalNaiveOracle
 from aerogrid.types import Schedule
@@ -17,30 +16,6 @@ from aerogrid.types import Schedule
 # --------------------------------------------------------------------------- #
 # fixtures                                                                    #
 # --------------------------------------------------------------------------- #
-@pytest.fixture
-def fake_onsets() -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    rows = []
-    base = datetime(2024, 10, 1, tzinfo=timezone.utc)
-    for d in range(40):
-        for app, peak_h in [("dishwasher", 21), ("washing_machine", 9)]:
-            h = int(np.clip(rng.normal(peak_h, 2), 0, 23))
-            rows.append(
-                {"appliance": app, "timestamp": base + timedelta(days=d, hours=h),
-                 "split": "train"}
-            )
-    for d in range(40, 54):
-        for app, peak_h in [("dishwasher", 21), ("washing_machine", 9)]:
-            h = int(np.clip(rng.normal(peak_h, 2), 0, 23))
-            rows.append(
-                {"appliance": app, "timestamp": base + timedelta(days=d, hours=h),
-                 "split": "test"}
-            )
-    df = pd.DataFrame(rows)
-    df["split"] = df["split"].astype("category")
-    return df
-
-
 @pytest.fixture
 def fake_prices() -> pd.DataFrame:
     base = datetime(2024, 10, 1, tzinfo=timezone.utc)
@@ -71,12 +46,10 @@ def _base_state(now: datetime, *, remaining_ev_kwh: float = 24.0) -> dict:
 # --------------------------------------------------------------------------- #
 # tests                                                                       #
 # --------------------------------------------------------------------------- #
-def test_graph_compiles_and_runs_once(fake_onsets, fake_prices):
+def test_graph_compiles_and_runs_once(fake_prices):
     hist = _providers(fake_prices)
-    predictor = HybridBehavioralPredictor().fit(fake_onsets)
     builder, checkpointer = build_graph(
         price_oracle=SeasonalNaiveOracle(),
-        predictor=predictor,
         price_history_provider=hist,
         auto_confirm=True,
     )
@@ -88,17 +61,15 @@ def test_graph_compiles_and_runs_once(fake_onsets, fake_prices):
     result = graph.invoke(state, config=cfg)
     plan = result["current_plan"]
     assert isinstance(plan, Schedule)
-    assert plan.solver_status in ("optimal", "optimal_inaccurate", "optimal_inaccurate")
+    assert plan.solver_status in ("optimal", "optimal_inaccurate")
     assert plan.horizon_slots > 0
     assert len(plan.ev_power_kw) == plan.horizon_slots
 
 
-def test_first_plan_interrupts_when_auto_confirm_off(fake_onsets, fake_prices):
+def test_first_plan_interrupts_when_auto_confirm_off(fake_prices):
     hist = _providers(fake_prices)
-    predictor = HybridBehavioralPredictor().fit(fake_onsets)
     builder, checkpointer = build_graph(
         price_oracle=SeasonalNaiveOracle(),
-        predictor=predictor,
         price_history_provider=hist,
         auto_confirm=False,
     )
@@ -113,12 +84,10 @@ def test_first_plan_interrupts_when_auto_confirm_off(fake_onsets, fake_prices):
     assert second.get("current_plan") is not None
 
 
-def test_auto_confirms_when_small_delta(fake_onsets, fake_prices):
+def test_auto_confirms_when_small_delta(fake_prices):
     hist = _providers(fake_prices)
-    predictor = HybridBehavioralPredictor().fit(fake_onsets)
     builder, checkpointer = build_graph(
         price_oracle=SeasonalNaiveOracle(),
-        predictor=predictor,
         price_history_provider=hist,
         auto_confirm=False,
     )

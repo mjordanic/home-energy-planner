@@ -14,8 +14,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, TypedDict
 
-import numpy as np
-
 from aerogrid.types import (
     ApplianceOnset,
     HITLDecision,
@@ -33,9 +31,8 @@ class AeroGridState(TypedDict, total=False):
     now: datetime
     latest_sample: Sample
 
-    # ---- Disaggregation (updated every sample) ---- #
-    per_appliance_power_w: dict[str, float]
-    new_onsets: list[ApplianceOnset]           # onsets detected since last state flush
+    # ---- Onsets (updated every sample) ---- #
+    new_onsets: list[ApplianceOnset]           # onsets received since last state flush
     recent_onsets: list[ApplianceOnset]        # rolling history, capped
 
     # ---- Commitment (updated every sample + on replan) ---- #
@@ -51,7 +48,6 @@ class AeroGridState(TypedDict, total=False):
 
     # ---- Planning (updated on replan only) ---- #
     price_forecast: PriceForecast | None       # short-horizon forecast
-    onset_probs: dict[str, np.ndarray]         # per-appliance behavioural priors
     current_plan: Schedule | None              # output of last replan
     previous_plan: Schedule | None             # last confirmed plan, for HITL diff
     committed_until: datetime | None           # first slot(s) of plan now committed

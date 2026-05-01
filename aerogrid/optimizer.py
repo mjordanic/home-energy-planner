@@ -166,13 +166,9 @@ forecast price::
              + κ · Σ_t π[t] · Σ_{c ∈ committed} P_c · 1[t ∈ c.range]
              + κ · Σ_t π[t] · Σ_{a ∈ pending}   P_a · z_a[t]
 
-There is no longer a "ghost reservation" utility term: every controlled
-load now strictly *needs* to deliver its energy (EV deadline, heater windows,
-pending cycles via C6), so the optimiser would always start using all of
-them — the reservation incentive only existed to coax the previous integer
-variables off zero. The old ``RESERVATION_LAMBDA`` knob remains in
-:mod:`aerogrid.config` for backward compatibility but no longer changes the
-solution.
+Every controlled load strictly *needs* to deliver its energy (EV deadline,
+heater windows, pending cycles via C6), so the optimiser will always start
+using all of them — there is no separate "reservation" utility term.
 
 Solver chain and fallback
 =========================
@@ -337,16 +333,30 @@ def _heater_window_slot_masks(
     horizon_slots: int,
     deadlines: tuple[HeaterEnergyDeadline, ...] = HEATER_DEADLINES,
 ) -> dict[int, np.ndarray]:
-    """For each heater deadline, return the slot mask of its window ∩ horizon.
+    """For each heater deadline, return the slot mask of its **current iteration**.
 
-    A slot contributes to the deadline whose boundary is the *next* one
-    strictly after that slot (circular over 24 h). This matches the window
-    definition ``(prev_h, h]`` while avoiding heavy datetime gymnastics.
+    A slot contributes to the deadline whose boundary is the *next* one strictly
+    after that slot (circular over 24 h). The mask, however, only covers the
+    *first* occurrence of each deadline in the horizon — i.e. the window
+    iteration whose ``kwh_required`` we're about to enforce. Slots that fall
+    into a later iteration of the same deadline (because the horizon spans
+    multiple days) are intentionally excluded; the next replan, fired after
+    each window resets, will constrain those iterations on their own. Lumping
+    iterations together would let the LP satisfy the current ``kwh_required``
+    using slots that physically belong to the *next* window — under-delivering
+    the deadline that's actually due.
     """
     if not deadlines:
         return {}
     sorted_hours = sorted(d.hour for d in deadlines)
     masks: dict[int, np.ndarray] = {h: np.zeros(horizon_slots, dtype=bool) for h in sorted_hours}
+
+    # First slot at which each deadline hour occurs (h:00 boundary).
+    first_deadline_slot: dict[int, int] = {h: horizon_slots for h in sorted_hours}
+    for t in range(horizon_slots):
+        slot_t = slot0 + timedelta(minutes=SLOT_MINUTES * t)
+        if slot_t.minute == 0 and slot_t.hour in first_deadline_slot and first_deadline_slot[slot_t.hour] == horizon_slots:
+            first_deadline_slot[slot_t.hour] = t
 
     deadline_minutes = {h: int(h * 60) for h in sorted_hours}
     for t in range(horizon_slots):
@@ -359,14 +369,17 @@ def _heater_window_slot_masks(
             for h in sorted_hours
         }
         h_star = min(sorted_hours, key=lambda h: dist[h])
-        masks[h_star][t] = True
+        # Restrict to the first iteration: only slots strictly before the
+        # first occurrence of h_star in the horizon belong to the current
+        # window. Slots at or after that occurrence are in the next iteration.
+        if t < first_deadline_slot[h_star]:
+            masks[h_star][t] = True
     return masks
 
 
 def solve_receding_horizon(
     now: datetime,
     prices: np.ndarray,
-    onset_probs: dict[str, np.ndarray] | None = None,        # kept for API compat; unused
     *,
     remaining_ev_kwh: float = EV_DAILY_NEED_KWH,
     remaining_heater_kwh_by_window: dict[int, float] | None = None,
@@ -380,8 +393,6 @@ def solve_receding_horizon(
     heater_deadlines: tuple[HeaterEnergyDeadline, ...] | None = None,
     ev_available_from_hour: int = EV_AVAILABLE_FROM_HOUR,
     ev_deadline_hour: int = EV_DEADLINE_HOUR,
-    # Legacy parameter, retained for backward compatibility. Has no effect.
-    reservation_lambda: float = 0.0,
 ) -> Schedule:
     """Solve the receding-horizon LP for the next ``horizon_slots`` slots.
 
@@ -396,9 +407,6 @@ def solve_receding_horizon(
         prices: 15-min price forecast in currency/MWh (e.g. EUR/MWh from the
             SMARD oracle). Length need not equal ``horizon_slots``; it is
             normalised by :func:`_prep_prices`.
-        onset_probs: Unused — accepted for backward compatibility with
-            existing callers (the graph passes this through). Cycle-based
-            scheduling now lives in the HITL reschedule path.
         remaining_ev_kwh: kWh the EV still needs before ``ev_deadline_hour``.
             Maintained outside this function by :class:`CommitTracker` and
             decremented in real time.
@@ -433,8 +441,6 @@ def solve_receding_horizon(
         heater_deadlines: Override of :data:`aerogrid.config.HEATER_DEADLINES`.
         ev_available_from_hour, ev_deadline_hour: Override the EV charging
             window boundaries.
-        reservation_lambda: Legacy. Currently has no effect — see the module
-            docstring on why the reservation utility is gone.
 
     Returns:
         :class:`~aerogrid.types.Schedule` populated with ``ev_power_kw``,

@@ -8,9 +8,8 @@ from typing import Literal
 
 @dataclass(frozen=True)
 class Sample:
-    """One 1 Hz meter reading emitted by the ScenarioStreamer."""
+    """One simulation tick emitted by the streamer."""
     t: datetime                   # wall-clock of this sample (UTC)
-    p_mains_w: float              # instantaneous household aggregate power
     realized_price: float | None = None   # $/MWh, populated on 15-min slot boundaries
 
 
@@ -19,7 +18,7 @@ class ApplianceOnset:
     appliance: str
     timestamp: datetime
     confidence: float             # [0, 1]
-    source: Literal["nilm", "disaggregator", "ground_truth", "injected"] = "disaggregator"
+    source: Literal["injected"] = "injected"
 
     def as_dict(self) -> dict:
         """Serialise the onset to a JSON-compatible dict."""

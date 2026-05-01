@@ -1,28 +1,28 @@
-"""Digital-twin orchestrator: streams data and ticks N independent strategies.
+"""Digital-twin orchestrator: streams ticks and runs N independent strategies.
 
 Architecture
 ------------
 The digital twin owns ONLY what is genuinely shared by the simulation
 environment:
 
-* :class:`ScenarioStreamer` — yields one mains sample per simulated second,
-* :class:`PriceServer` — provides the realized electricity price every
-  strategy is evaluated against (this is physical reality, not a forecast),
-* the queue of synthetic injected onsets used for stress tests,
+* :class:`Streamer` — yields one tick per simulated second and carries the
+  realized electricity price on slot boundaries,
+* :class:`PriceServer` — supplies the realized price (physical reality,
+  not a forecast),
+* the queue of manually-listed appliance onsets,
 * cross-strategy onset gating.
 
-It does NOT own any policy logic, NILM disaggregator, behavioural predictor,
-price oracle, or LangGraph.  Each strategy carries its own copy of whatever
-it needs and builds it inside its own constructor.
+It owns no policy logic, no oracle, no LangGraph — every strategy carries
+its own machinery and builds it in its own constructor.
 
 Per simulation tick the orchestrator:
 
-1. pulls injected onsets due at this timestamp,
-2. **gates** them across strategies — an injected onset is suppressed if
-   any strategy still has the appliance pending or running (prevents
-   unrealistic double-loading).  Natural onsets perceived by each strategy's
-   own machinery are NOT gated,
-3. ticks every strategy with the same ``(sample, gated_injected_onsets)`` pair,
+1. pulls onsets due at this timestamp,
+2. **gates** them across strategies — an onset is suppressed if any
+   strategy still has the same appliance pending or running, preventing
+   the "phantom second cycle" effect when two strategies disagree on the
+   length of a cycle,
+3. ticks every strategy with the same ``(sample, gated_onsets)`` pair,
 4. at every 15-min slot boundary, asks each strategy for a SlotRecord and
    merges them into a wide row (column-prefixed by ``strategy.name``),
 5. flushes events from each strategy into a single per-decision event log.
@@ -31,8 +31,8 @@ Outputs
 -------
 ``slot_log.parquet``
     One row per 15-min slot. Columns: timestamp, price, suppressed/permitted
-    INJECTED onsets, plus ``<strategy>_*`` columns for every strategy's
-    power profile and cumulative cost.
+    onsets, plus ``<strategy>_*`` columns for every strategy's power
+    profile and cumulative cost.
 
 ``event_log.parquet``
     One row per decision at 1-second resolution. Schema is uniform across
@@ -66,15 +66,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from aerogrid.config import (
+    APPLIANCE_ONSETS,
     EVENT_LOG_PATH,
     HITL_AUTO_RESPONSES,
     HORIZON_HOURS,
-    INJECTED_APPLIANCE_ONSETS,
     INJECTED_PRICE_SPIKES,
     RUN_LOG_PATH,
-    SCENARIO_TEST_END,
-    SCENARIO_TEST_START,
     SHORT_HORIZON_SLOTS,
+    SIM_TEST_END,
+    SIM_TEST_START,
     SLOT_LOG_PATH,
     SLOT_MINUTES,
 )
@@ -86,7 +86,7 @@ from aerogrid.sim.strategies import (
     Strategy,
     make_event,
 )
-from aerogrid.sim.streamer import ScenarioStreamer
+from aerogrid.sim.streamer import Streamer
 from aerogrid.types import ApplianceOnset
 
 logger = logging.getLogger(__name__)
@@ -101,11 +101,12 @@ def _gate_onsets(
     strategies: list[Strategy],
     now: datetime,
 ) -> tuple[list[ApplianceOnset], list[tuple[ApplianceOnset, list[str]]]]:
-    """Split *candidate_onsets* (INJECTED) into permitted vs suppressed.
+    """Split *candidate_onsets* into permitted vs suppressed.
 
-    An injected onset is suppressed if **any** strategy still has the same
-    appliance pending or running.  Natural onsets perceived inside each
-    strategy do NOT pass through this function.
+    An onset is suppressed if **any** strategy still has the same appliance
+    pending or running, since restarting the cycle while one strategy
+    hasn't finished it would create a phantom second cycle in the
+    comparison.
     """
     permitted: list[ApplianceOnset] = []
     suppressed: list[tuple[ApplianceOnset, list[str]]] = []
@@ -132,7 +133,7 @@ def _gate_onsets(
 def run(
     *,
     strategies: list[Strategy],
-    streamer: ScenarioStreamer,
+    streamer: Streamer,
     start: datetime,
     end: datetime,
     slot_log_path: Path,
@@ -159,11 +160,11 @@ def run(
     for sample in streamer.iter_samples(start=start, end=end):
         n_samples += 1
 
-        # 1. Pull synthetic injected onsets due at this timestamp.
-        injected = streamer.consume_injected_onsets(sample.t)
+        # 1. Pull onsets due at this timestamp.
+        due_onsets = streamer.consume_injected_onsets(sample.t)
 
         # 2. Cross-strategy gating.
-        permitted, suppressed = _gate_onsets(injected, strategies, sample.t)
+        permitted, suppressed = _gate_onsets(due_onsets, strategies, sample.t)
         n_suppressed_total += len(suppressed)
 
         # 3. Stream-level events for the unified event log.
@@ -174,7 +175,7 @@ def run(
                 event_type="onset_permitted",
                 appliance=onset.appliance,
                 price_eur_mwh=last_realized_price,
-                detail=f"source={onset.source} confidence={onset.confidence:.2f}",
+                detail=f"confidence={onset.confidence:.2f}",
             ))
         for onset, blockers in suppressed:
             event_rows.append(make_event(
@@ -183,13 +184,10 @@ def run(
                 event_type="onset_suppressed",
                 appliance=onset.appliance,
                 price_eur_mwh=last_realized_price,
-                detail=(
-                    f"blocked_by=[{','.join(blockers)}] "
-                    f"source={onset.source}"
-                ),
+                detail=f"blocked_by=[{','.join(blockers)}]",
             ))
 
-        # 4. Tick every strategy with the same (sample, gated injected onsets).
+        # 4. Tick every strategy with the same (sample, gated onsets).
         for s in strategies:
             s.tick(sample, permitted, dt_s=1.0)
 
@@ -199,7 +197,7 @@ def run(
             row: dict = {
                 "timestamp": sample.t,
                 "price_eur_mwh": sample.realized_price,
-                "permitted_onsets": ",".join(sorted({o.appliance for o in permitted})),
+                "onsets": ",".join(sorted({o.appliance for o in permitted})),
                 "suppressed_onsets": ",".join(
                     sorted({o.appliance for o, _ in suppressed})
                 ),
@@ -302,8 +300,8 @@ def main() -> int:
     # ---- Shared infrastructure (truly shared by every strategy) -----------
     server = PriceServer()
     server.spike_events = [(at, float(mag)) for at, mag in INJECTED_PRICE_SPIKES]
-    streamer = ScenarioStreamer(realized_price_provider=server.realized)
-    for appliance, at in INJECTED_APPLIANCE_ONSETS:
+    streamer = Streamer(realized_price_provider=server.realized)
+    for appliance, at in APPLIANCE_ONSETS:
         streamer.add_onset(appliance=appliance, timestamp=at)
 
     # ---- Strategies (each fully encapsulates its own private machinery) ---
@@ -320,8 +318,8 @@ def main() -> int:
     strategies: list[Strategy] = [baseline, optimizer]
 
     # ---- Window selection ------------------------------------------------
-    start = SCENARIO_TEST_START
-    end = SCENARIO_TEST_END
+    start = SIM_TEST_START
+    end = SIM_TEST_END
     if args.hours is not None:
         end = min(end, start + timedelta(hours=args.hours))
     elif args.days is not None:
@@ -339,7 +337,7 @@ def main() -> int:
     # ---- Final summary ---------------------------------------------------
     print("\n=== simulation summary ===")
     print(f"samples:                    {summary['n_samples']:,}")
-    print(f"injected onsets suppressed: {summary['n_suppressed_total']}")
+    print(f"onsets suppressed:          {summary['n_suppressed_total']}")
     print(f"slot log:                   {summary['slot_log_path']}")
     print(f"event log:                  {summary['event_log_path']}")
     print()

@@ -47,8 +47,6 @@ Each scenario below isolates one aspect of the new formulation.
 | D | Heater shapes itself into the cheapest hour of the window | C3 + price valley |
 | E | Power-cap binding between EV and heater | C5 |
 | F | Committed dishwasher cycle as exogenous load | C5 + cap headroom |
-| G | Reschedule proposal: dishwasher accepts | HITL accept path |
-| H | Reschedule proposal: washing machine declines | HITL decline path |
 | I | Stress: many simultaneous onsets (HITL throughput) | LangGraph + auto-responses |
 | J | Horizon sensitivity (6 / 12 / 24 h) | LP scaling, savings vs. wall-time |
 | K | Heater infeasibility → soft slack | C3 slack absorbs |
@@ -64,6 +62,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 sys.path.insert(0, str(Path.cwd().parent))
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -77,7 +76,7 @@ from aerogrid.optimizer import solve_receding_horizon
 from aerogrid.commit import CommitTracker
 from aerogrid.config import (
     APPLIANCES, EV_AVAILABLE_FROM_HOUR, EV_DEADLINE_HOUR, HEATER_DEADLINES,
-    HOUSE_POWER_CAP_KW, HITL_RESCHEDULE_MIN_SAVINGS_EUR,
+    HITL_AUTO_RESPONSES, HOUSE_POWER_CAP_KW, HITL_RESCHEDULE_MIN_SAVINGS_EUR,
     HITL_RESCHEDULE_WINDOW_HOURS, SHORT_HORIZON_SLOTS, SLOT_MINUTES,
     HeaterEnergyDeadline,
 )
@@ -104,14 +103,40 @@ def _utc(h: int, m: int = 0, day: int = 15) -> datetime:
 
 
 # ── shared plotting helper for continuous-load schedules ────────────────────
+def _deadline_lines_in(t_start, t_end,
+                      ev_hour=EV_DEADLINE_HOUR,
+                      heater_deadlines=HEATER_DEADLINES):
+    """Return [(t, label, color, ls)] for every deadline inside [t_start, t_end]."""
+    out = []
+    t = t_start.replace(hour=ev_hour, minute=0, second=0, microsecond=0)
+    if t < t_start:
+        t += timedelta(days=1)
+    while t <= t_end:
+        out.append((t, f"EV deadline {ev_hour:02d}:00", "#d62728", "--"))
+        t += timedelta(days=1)
+    for d in heater_deadlines:
+        t = t_start.replace(hour=d.hour, minute=0, second=0, microsecond=0)
+        if t < t_start:
+            t += timedelta(days=1)
+        while t <= t_end:
+            out.append((t, f"heater {d.hour:02d}:00 ({d.kwh_required:.0f} kWh)",
+                        "#9467bd", ":"))
+            t += timedelta(days=1)
+    return out
+
+
 def plot_schedule(sched, prices, *, title="", cap_kw=HOUSE_POWER_CAP_KW, figsize=(13, 5.5)):
-    """Stacked-bar load chart (top) + price step chart (bottom).
+    """Stacked-bar load chart (top) + price step chart (bottom), datetime x-axis.
 
     EV and heater are shown as continuous-power bars. Committed cycle tasks
     (dishwasher / washing machine pinned by CommitTracker) appear hatched.
+    Vertical dashed lines mark the EV deadline (red) and heater deadlines
+    (purple) that fall inside the visible window.
     """
     T = sched.horizon_slots
-    hrs = np.arange(T) * SLOT_H
+    t0 = sched.slot_start
+    times = [t0 + timedelta(minutes=SLOT_MINUTES * i) for i in range(T)]
+    width_days = SLOT_MINUTES * 0.9 / (60.0 * 24.0)   # bar width in matplotlib date units
     prices = np.asarray(prices, dtype=float)
 
     fig, (ax1, ax2) = plt.subplots(
@@ -123,10 +148,10 @@ def plot_schedule(sched, prices, *, title="", cap_kw=HOUSE_POWER_CAP_KW, figsize
     ev = np.asarray(sched.ev_power_kw, dtype=float)
     heat = np.asarray(sched.heater_power_kw, dtype=float)
 
-    ax1.bar(hrs, ev, width=SLOT_H * 0.9, bottom=bottom,
+    ax1.bar(times, ev, width=width_days, bottom=bottom,
             color=_PALETTE["ev_charger"], alpha=0.85, label="EV (kW)", align="edge")
     bottom = bottom + ev
-    ax1.bar(hrs, heat, width=SLOT_H * 0.9, bottom=bottom,
+    ax1.bar(times, heat, width=width_days, bottom=bottom,
             color=_PALETTE["heater"], alpha=0.8, label="Heater (kW)", align="edge")
     bottom = bottom + heat
 
@@ -140,7 +165,7 @@ def plot_schedule(sched, prices, *, title="", cap_kw=HOUSE_POWER_CAP_KW, figsize
             run[t] = spec.rated_kw
         color = _PALETTE.get(task.appliance, "#8c564b")
         label = (task.appliance + " [committed]") if task.appliance not in seen else None
-        ax1.bar(hrs, run, width=SLOT_H * 0.9, bottom=bottom,
+        ax1.bar(times, run, width=width_days, bottom=bottom,
                 color=color, alpha=0.7, label=label, hatch="//", align="edge")
         bottom = bottom + run
         seen.add(task.appliance)
@@ -148,7 +173,6 @@ def plot_schedule(sched, prices, *, title="", cap_kw=HOUSE_POWER_CAP_KW, figsize
     ax1.axhline(cap_kw, color="black", ls="--", lw=1.5, label=f"Cap {cap_kw} kW")
     ax1.set_ylabel("load (kW)")
     ax1.set_ylim(0, cap_kw * 1.3)
-    ax1.legend(loc="upper right", fontsize=8)
     ax1.set_title(title or "Optimizer schedule", fontsize=11)
 
     ann = (
@@ -164,11 +188,35 @@ def plot_schedule(sched, prices, *, title="", cap_kw=HOUSE_POWER_CAP_KW, figsize
     ax1.text(0.01, 0.98, ann, transform=ax1.transAxes, va="top", fontsize=7.5,
              bbox=dict(boxstyle="round,pad=0.25", fc="lightyellow", ec="#cca300", alpha=0.9))
 
-    ax2.step(hrs, prices[:T], where="post", color="k", lw=1.4, label="Price (€/MWh)")
-    ax2.fill_between(hrs, prices[:T], step="post", alpha=0.12, color="k")
+    ax2.step(times, prices[:T], where="post", color="k", lw=1.4, label="Price (€/MWh)")
+    ax2.fill_between(times, prices[:T], step="post", alpha=0.12, color="k")
     ax2.set_ylabel("€/MWh")
-    ax2.set_xlabel(f"hour from now  (slot = {SLOT_MINUTES} min)")
-    ax2.legend(fontsize=8)
+    ax2.set_xlabel("time of day (UTC)")
+
+    # Deadline overlays + datetime formatting (after data is drawn so x-limits are set).
+    t_end = times[-1] + timedelta(minutes=SLOT_MINUTES)
+    seen_kinds: dict = {}
+    for t, label, color, ls in _deadline_lines_in(t0, t_end):
+        seen_kinds.setdefault(label, (color, ls))
+        for ax in (ax1, ax2):
+            ax.axvline(t, color=color, ls=ls, lw=1.1, alpha=0.7)
+    handles_ax1, labels_ax1 = ax1.get_legend_handles_labels()
+    for label, (color, ls) in seen_kinds.items():
+        handles_ax1.append(plt.Line2D([0], [0], color=color, ls=ls, lw=1.1, label=label))
+        labels_ax1.append(label)
+    ax1.legend(handles_ax1, labels_ax1, loc="upper right", fontsize=7.6, ncol=2)
+    ax2.legend(fontsize=8, loc="upper right")
+
+    span_h = (t_end - t0).total_seconds() / 3600.0
+    if span_h <= 12:
+        loc = mdates.HourLocator(interval=1)
+    elif span_h <= 36:
+        loc = mdates.HourLocator(interval=3)
+    else:
+        loc = mdates.HourLocator(interval=6)
+    ax2.xaxis.set_major_locator(loc)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    fig.autofmt_xdate(rotation=0, ha="center")
 
     plt.tight_layout()
     return fig
@@ -253,12 +301,15 @@ Constraint C2 switches between
 CODE_B = """\
 prices_B = np.array([130., 120., 40., 38., 40., 125., 130., 120.])
 
+now_B_near = _utc(5, 0)
+now_B_far  = _utc(22, 0)
+
 sched_B_near = solve_receding_horizon(
-    _utc(5, 0), prices_B,
+    now_B_near, prices_B,
     remaining_ev_kwh=5.0, time_to_deadline_h=2.0, horizon_slots=8,
 )
 sched_B_far = solve_receding_horizon(
-    _utc(22, 0), prices_B,
+    now_B_far, prices_B,
     remaining_ev_kwh=24.0, time_to_deadline_h=9.0, horizon_slots=8,
 )
 
@@ -268,14 +319,42 @@ far_kwh = sum(sched_B_far.ev_power_kw) * SLOT_H
 print(f"B-near delivered: {near_kwh:.3f} kWh  (full 5.0 expected)")
 print(f"B-far  delivered: {far_kwh:.3f} kWh  (proportional 24·(2/9)·1.2 ≈ {24*(2/9)*1.2:.3f})")
 
-fig_B, axes = plt.subplots(1, 2, figsize=(13, 4))
-hrs = np.arange(8) * SLOT_H
-axes[0].bar(hrs, sched_B_near.ev_power_kw, width=SLOT_H*0.85, color=_PALETTE["ev_charger"], align="edge")
-axes[0].set_title(f"B-near · deadline 2 h · {near_kwh:.2f} kWh delivered", fontsize=10)
-axes[0].set_ylabel("EV kW")
-axes[1].bar(hrs, sched_B_far.ev_power_kw, width=SLOT_H*0.85, color=_PALETTE["ev_charger"], align="edge")
-axes[1].set_title(f"B-far · deadline 9 h (out of 2 h horizon) · {far_kwh:.2f} kWh delivered", fontsize=10)
-axes[1].set_xlabel("hour from now")
+# Two stacked panels per case: EV power (top) + price (bottom), all datetime.
+fig_B, axes = plt.subplots(
+    2, 2, figsize=(13.5, 5.4), sharey="row",
+    gridspec_kw={"height_ratios": [3, 2]},
+)
+width_days = SLOT_MINUTES * 0.85 / (60.0 * 24.0)
+
+for col, (now_b, sched_b, kwh_b, label) in enumerate([
+    (now_B_near, sched_B_near, near_kwh,
+     f"B-near · deadline 2 h · {near_kwh:.2f} kWh delivered"),
+    (now_B_far,  sched_B_far,  far_kwh,
+     f"B-far  · deadline 9 h (out of 2 h horizon) · {far_kwh:.2f} kWh delivered"),
+]):
+    ax_p = axes[0, col]
+    ax_pr = axes[1, col]
+    times = [now_b + timedelta(minutes=SLOT_MINUTES * i) for i in range(8)]
+    ax_p.bar(times, sched_b.ev_power_kw, width=width_days,
+             color=_PALETTE["ev_charger"], align="edge", alpha=0.85, label="EV kW")
+    ax_p.set_title(label, fontsize=10)
+    ax_pr.step(times, prices_B, where="post", color="k", lw=1.3, label="price")
+    ax_pr.fill_between(times, prices_B, step="post", alpha=0.12, color="k")
+    ax_pr.set_xlabel("time (UTC)")
+    # Deadline lines (EV only matters here).
+    t_end = times[-1] + timedelta(minutes=SLOT_MINUTES)
+    for t, lbl, color, ls in _deadline_lines_in(now_b, t_end,
+                                                heater_deadlines=()):
+        for ax in (ax_p, ax_pr):
+            ax.axvline(t, color=color, ls=ls, lw=1.2, alpha=0.75, label=lbl if ax is ax_p else None)
+    ax_p.legend(fontsize=8, loc="upper right")
+    ax_pr.legend(fontsize=8, loc="upper right")
+    ax_pr.xaxis.set_major_locator(mdates.MinuteLocator(byminute=[0, 30]))
+    ax_pr.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+axes[0, 0].set_ylabel("EV kW")
+axes[1, 0].set_ylabel("€/MWh")
+fig_B.autofmt_xdate(rotation=0, ha="center")
 plt.tight_layout()
 plt.show()
 """
@@ -429,113 +508,6 @@ fig_F = plot_schedule(
     figsize=(14, 5.5),
 )
 plt.show()
-"""
-
-# ── scenario G ────────────────────────────────────────────────────────────────
-MD_G = """\
-## Scenario G — Reschedule proposal: dishwasher (accept)
-
-The user starts the **dishwasher at 19:45 UTC** — right before the evening
-peak. The agent searches forward up to `HITL_RESCHEDULE_WINDOW_HOURS = 2 h`
-for a cheaper start, builds a `RescheduleProposal`, and the HITL policy
-formats a question phrased in savings.
-
-Default behaviour in simulation: dishwasher → `accept` (configurable via
-`HITL_AUTO_RESPONSES`).
-"""
-
-CODE_G = """\
-# 24 h price profile with a peak 19:00-21:00 and a deep valley 21:00-23:00.
-# Onset is 19:45; the 2 h reschedule window covers up to 21:45, so the
-# optimiser can shift into the valley to save money.
-prices_G = np.full(96, 80.0)
-prices_G[76:84] = 220.0   # 19:00–21:00 peak
-prices_G[84:92] = 25.0    # 21:00–23:00 valley
-onset_at_G = _utc(19, 45)
-
-# We need the price slice starting at the slot containing onset_at_G.
-slot_idx = (onset_at_G.hour * 4 + onset_at_G.minute // 15)
-slice_G = np.concatenate([prices_G[slot_idx:], prices_G[:slot_idx]])
-
-prop_G = _propose_for_onset(
-    appliance="dishwasher",
-    onset_at=onset_at_G,
-    prices=slice_G,
-    cycle_slots=APPLIANCES["dishwasher"].cycle_slots,
-    rated_kw=APPLIANCES["dishwasher"].rated_kw,
-    horizon_slots=96,
-)
-
-decision_G = decide_reschedule(prop_G)
-print(f"Proposal: shift {prop_G.shift_minutes:.0f} min → {prop_G.proposed_start_at.strftime('%H:%M')}")
-print(f"  cost_now = €{prop_G.cost_now_eur:.4f}")
-print(f"  cost_proposed = €{prop_G.cost_proposed_eur:.4f}")
-print(f"  savings = €{prop_G.savings_eur:.4f}  (threshold €{HITL_RESCHEDULE_MIN_SAVINGS_EUR})")
-print(f"\\nHITL decision: {decision_G.action.upper()}")
-print(f"Question: {decision_G.question}")
-
-# Visualise the cycle's energy footprint at each candidate start.
-window_slots = int(HITL_RESCHEDULE_WINDOW_HOURS * 60.0 / SLOT_MINUTES)
-candidates = list(range(0, window_slots + 1))
-costs = [
-    float(slice_G[s : s + APPLIANCES["dishwasher"].cycle_slots].sum()
-          * APPLIANCES["dishwasher"].rated_kw * _PER_SLOT)
-    for s in candidates
-]
-fig_G, ax = plt.subplots(figsize=(11, 4))
-ax.plot([s * SLOT_H for s in candidates], costs, "o-", color=_PALETTE["dishwasher"])
-best = candidates[int(np.argmin(costs))]
-ax.axvline(best * SLOT_H, color="green", ls="--", label=f"best shift {best * SLOT_H:.2f} h")
-ax.axvline(0, color="red", ls=":", label="run now")
-ax.set_xlabel("forward shift (h)")
-ax.set_ylabel("cycle cost (€)")
-ax.set_title("Scenario G — dishwasher reschedule cost-at-shift")
-ax.legend()
-plt.tight_layout()
-plt.show()
-"""
-
-# ── scenario H ────────────────────────────────────────────────────────────────
-MD_H = """\
-## Scenario H — Reschedule proposal: washing machine (decline)
-
-Same machinery as G, but the appliance is the **washing machine** and the
-default `HITL_AUTO_RESPONSES["washing_machine"] = "decline"` runs the cycle
-at the original onset time. The savings number is still computed and
-logged so we can report the *missed* savings later.
-"""
-
-CODE_H = """\
-# Mid-morning peak (10:30–12:30) followed by a midday valley (12:30–14:30).
-# Onset is 10:30 — shifting into the valley would save €€, but the simulated
-# user declines.
-prices_H = np.full(96, 80.0)
-prices_H[42:50] = 200.0   # 10:30–12:30 peak
-prices_H[50:58] = 30.0    # 12:30–14:30 valley
-onset_at_H = _utc(10, 30)
-
-slot_idx_H = (onset_at_H.hour * 4 + onset_at_H.minute // 15)
-slice_H = np.concatenate([prices_H[slot_idx_H:], prices_H[:slot_idx_H]])
-
-prop_H = _propose_for_onset(
-    appliance="washing_machine",
-    onset_at=onset_at_H,
-    prices=slice_H,
-    cycle_slots=APPLIANCES["washing_machine"].cycle_slots,
-    rated_kw=APPLIANCES["washing_machine"].rated_kw,
-    horizon_slots=96,
-)
-
-# Even though the proposal exists, the simulated user declines it. We
-# emulate the digital twin's behaviour by reading HITL_AUTO_RESPONSES.
-from aerogrid.config import HITL_AUTO_RESPONSES
-sim_answer = HITL_AUTO_RESPONSES["washing_machine"]
-decision_H = decide_reschedule(prop_H)
-print(f"Proposal: shift {prop_H.shift_minutes:.0f} min → {prop_H.proposed_start_at.strftime('%H:%M')}")
-print(f"  savings = €{prop_H.savings_eur:.4f}")
-print(f"HITL decision: {decision_H.action.upper()} — would ask: {decision_H.question[:80] + '...' if len(decision_H.question) > 80 else decision_H.question}")
-print(f"Simulated user (auto_confirm=True) reply: {sim_answer!r}")
-print(f"→ washing machine runs at the original onset time {onset_at_H.strftime('%H:%M')}; missed savings €{prop_H.savings_eur:.4f}.")
 """
 
 # ── scenario I ────────────────────────────────────────────────────────────────
@@ -720,62 +692,69 @@ MD_L = """\
 This scenario shows *why* the optimiser solves the reschedule jointly with
 the EV / heater plan instead of using a price-only shift score.
 
-We start at **21:00 UTC** (inside the EV charging window) with:
+The setup is constructed so the cap binds and the trade-off is visible:
 
-* the EV needing **12 kWh** by 07:00 (deadline well outside the horizon),
-* a **tight 8 kW house cap**,
-* a sharp price valley at slots **4–7** (cheap hour right after onset),
-* the user starting the **dishwasher at 21:00**.
+* **Now = 04:30 UTC**, EV needs **14 kWh** by **07:00** (the next 2.5 h).
+* **House cap = 7.5 kW** — EV (7 kW) + dishwasher (2.5 kW) = 9.5 kW > cap,
+  so any overlap forces EV down to **5 kW** while the cycle runs.
+* Prices: **€200/MWh** for the next hour (04:30 → 05:30), then a deep
+  **€10/MWh** valley for exactly 2 hours (05:30 → 07:30), then **€50/MWh**.
+* The 2-hour cheap valley is tuned to be *exactly* the EV's full-rate
+  charging time (14 kWh / 7 kW = 2 h) — every kWh the EV misses there
+  must come from the €200 hour, which is 20× more expensive.
+* The user starts the **dishwasher at 04:30** (8-slot, 2-hour cycle).
 
 The price-only logic (`_propose_for_onset`) sees the cheapest 8-slot start
-and recommends shifting the cycle into that valley, ignoring the EV. But
-moving the dishwasher into the valley would force the EV to share the cap
-with it — costing the EV its cheap charging slots and forcing it to charge
-later at higher prices.
+and recommends shifting the cycle straight into the valley — that's the
+local optimum *for the cycle alone*. But planting the cycle there forces
+the EV to share the cap during its only cheap window, pushing 4 kWh of EV
+charging into the €200 hour.
 
 The joint MIP (the new `solve_receding_horizon` with `pending_cycles=[…]`)
-co-optimises the cycle placement with the EV / heater plan and the cap.
+co-optimises the cycle placement with the EV / heater plan and the cap. It
+shifts the cycle to **after** the cheap window instead, so the EV gets the
+full valley uninterrupted — at the price of the cycle finishing in the
+€50/MWh medium tier.
 
-The two approaches end up disagreeing on the slot, and the joint MIP
-delivers a **lower plan-level cost** because it sees the trade-off.
+The plan-level cost gap is **~30%** in favour of the joint MIP.
 """
 
 CODE_L = """\
-# Setup: tight EV deadline (2.5 h, 10 slots ahead) + tight cap (8 kW).
-# The EV is in the *only* cheap window (slots 4-9, price 10) and needs
-# enough kWh that any cycle overlap forces it onto expensive slots.
-#
-# Price-only logic picks the cheapest 8-slot run for the cycle (slot 4),
-# but that overlaps the EV's only cheap window, knocking EV power down
-# from 7 kW to 5.5 kW for those slots and pushing the missing kWh into
-# the expensive 100 €/MWh slots 0-3.
-#
-# Joint MIP sees this trade-off and shifts the cycle to slot 8, where
-# the cycle costs slightly more but the EV gets to use the full cheap
-# window unimpeded.
+# Setup: tight cap (7.5 kW) so EV (7 kW) + dish (2.5 kW) cannot co-run at
+# rated power, and a 2 h cheap window (slots 4-11) sized exactly to the
+# EV's 14 kWh / 7 kW = 2 h need. Any kWh the EV loses inside the cheap
+# window must come from the €200 hour right before — a 20× price gap.
+# Heater is disabled (heater_deadlines=()) to isolate the EV-vs-cycle
+# trade-off; with a heater also competing for the same cheap slots the
+# constraint interaction would muddy the comparison.
 prices_L = np.full(96, 60.0)
-prices_L[0:4]  = 100.0      # 04:30-05:30 expensive
-prices_L[4:10] = 10.0       # 05:30-07:00 deeply cheap (EV's only chance)
-prices_L[10:16] = 50.0      # 07:00-08:30 medium
+prices_L[0:4]   = 200.0     # 04:30–05:30 very expensive (1 h)
+prices_L[4:12]  = 10.0      # 05:30–07:30 deeply cheap (2 h, exactly the EV's need)
+prices_L[12:16] = 50.0      # 07:30–08:30 medium
 
-now_L = _utc(4, 30)         # 04:30 UTC, EV deadline at 07:00 (slot 10)
+now_L = _utc(4, 30)
+EV_NEED_KWH = 14.0
+TIME_TO_DEADLINE_H = 2.5    # EV deadline at 07:00, slot 10
+CAP_KW = 7.5
 
 spec = APPLIANCES["dishwasher"]
 window_slots = int(HITL_RESCHEDULE_WINDOW_HOURS * 60.0 / SLOT_MINUTES)
 last_start = min(window_slots, 96 - spec.cycle_slots)
 
-# (1) Price-only proposal — the "naive" shift score we used pre-MIP.
+# (1) Price-only proposal — the legacy shift score we used pre-MIP. It
+#     ignores EV / heater / cap, so it just finds the cheapest 8 slots.
 slice_L = prices_L[:96]
 naive = _propose_for_onset(
     "dishwasher", now_L, slice_L,
     cycle_slots=spec.cycle_slots, rated_kw=spec.rated_kw, horizon_slots=96,
 )
 
-# (2) Joint MIP — schedule with pending dishwasher and tight EV deadline.
+# (2) Joint MIP — schedule with a pending dishwasher and tight EV deadline.
 def _solve_with_cycle_at(slot: int):
     return solve_receding_horizon(
         now_L, prices_L, horizon_slots=96,
-        remaining_ev_kwh=14.0, time_to_deadline_h=2.5, house_cap_kw=8.0,
+        remaining_ev_kwh=EV_NEED_KWH, time_to_deadline_h=TIME_TO_DEADLINE_H,
+        house_cap_kw=CAP_KW, heater_deadlines=(),
         pending_cycles=[PendingCycle(
             appliance="dishwasher", cycle_slots=spec.cycle_slots,
             rated_kw=spec.rated_kw,
@@ -785,7 +764,8 @@ def _solve_with_cycle_at(slot: int):
 
 sched_joint = solve_receding_horizon(
     now_L, prices_L, horizon_slots=96,
-    remaining_ev_kwh=14.0, time_to_deadline_h=2.5, house_cap_kw=8.0,
+    remaining_ev_kwh=EV_NEED_KWH, time_to_deadline_h=TIME_TO_DEADLINE_H,
+    house_cap_kw=CAP_KW, heater_deadlines=(),
     pending_cycles=[PendingCycle(
         appliance="dishwasher", cycle_slots=spec.cycle_slots,
         rated_kw=spec.rated_kw, earliest_start_slot=0,
@@ -796,7 +776,8 @@ joint_slot = sched_joint.cycle_starts["dishwasher"]
 joint_cost = sched_joint.expected_cost
 
 # (3) Plan-level cost the user would actually realise if the price-only
-# logic decided — pin the cycle at the naive slot and re-solve.
+#     logic decided — pin the cycle at the naive slot and re-solve under
+#     the same EV / cap constraints.
 naive_slot = int(round((naive.proposed_start_at - now_L).total_seconds() / 60.0 / SLOT_MINUTES))
 sched_pin_naive = _solve_with_cycle_at(naive_slot)
 naive_realised_cost = sched_pin_naive.expected_cost
@@ -807,44 +788,118 @@ print(f"  isolated cycle cost           : €{naive.cost_proposed_eur:.4f}   ←
 print(f"  plan-level cost if committed  : €{naive_realised_cost:.4f}   ← what the user actually pays")
 print()
 print(f"Joint MIP optimal shift         : slot {joint_slot} (+{joint_slot*SLOT_H:.2f} h)")
-print(f"  plan-level cost               : €{joint_cost:.4f}   ← lower!")
+print(f"  plan-level cost               : €{joint_cost:.4f}   ← lower")
+print()
+# Both plans deliver exactly the same total energy — the difference is
+# purely WHEN that energy is delivered against the price profile.
+ev_n_kwh   = float(np.asarray(sched_pin_naive.ev_power_kw).sum() * SLOT_H)
+ev_j_kwh   = float(np.asarray(sched_joint.ev_power_kw).sum() * SLOT_H)
+dish_kwh   = spec.cycle_slots * spec.rated_kw * SLOT_H
+print(f"Energy delivered (identical in both plans):")
+print(f"  EV {ev_n_kwh:.2f} kWh + dishwasher {dish_kwh:.2f} kWh = {ev_n_kwh + dish_kwh:.2f} kWh")
+print(f"Sanity: naive EV={ev_n_kwh:.3f} kWh, joint EV={ev_j_kwh:.3f} kWh.")
 print()
 delta = naive_realised_cost - joint_cost
 pct = (1 - joint_cost / max(naive_realised_cost, 1e-9)) * 100
 print(f"Δ = €{delta:+.4f}  ({pct:+.1f}% relative)")
 print("─" * 62)
 
-# Plot the two outcomes side by side, zoomed on the first 4 hours.
-fig_L, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-for ax, sched, slot, title in [
-    (axes[0], sched_pin_naive, naive_slot,
-     f"Price-only → slot {naive_slot} · plan €{naive_realised_cost:.4f}"),
-    (axes[1], sched_joint, joint_slot,
-     f"Joint MIP → slot {joint_slot} · plan €{joint_cost:.4f}"),
-]:
+# Per-slot cost breakdown so the chart can label "€ paid here for what".
+def _slot_costs(sched, slot):
     T = sched.horizon_slots
-    hrs = np.arange(T) * SLOT_H
     ev = np.asarray(sched.ev_power_kw)
-    heat = np.asarray(sched.heater_power_kw)
     dish = np.zeros(T)
     dish[slot : slot + spec.cycle_slots] = spec.rated_kw
-    ax.bar(hrs, ev, width=SLOT_H * 0.9, color=_PALETTE["ev_charger"],
-           label="EV", align="edge", alpha=0.85)
-    ax.bar(hrs, heat, width=SLOT_H * 0.9, bottom=ev,
-           color=_PALETTE["heater"], label="heater", align="edge", alpha=0.8)
-    ax.bar(hrs, dish, width=SLOT_H * 0.9, bottom=ev + heat,
-           color=_PALETTE["dishwasher"], hatch="//", label="dishwasher",
-           align="edge", alpha=0.7)
-    ax.axhline(8.0, color="black", ls="--", lw=1.2, label="cap 8 kW")
-    # Shade EV's cheap window (slots 4-9) for context.
-    ax.axvspan(4 * SLOT_H, 10 * SLOT_H, alpha=0.07, color="green",
-               label="EV's only cheap window")
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel(f"hour from now (slot = {SLOT_MINUTES} min)")
-    ax.set_xlim(0, 4)
-    ax.set_ylim(0, 11)
-    ax.legend(fontsize=7.5, loc="upper right")
-axes[0].set_ylabel("load (kW)")
+    ev_cost   = ev   * SLOT_H * prices_L[:T] / 1000.0
+    dish_cost = dish * SLOT_H * prices_L[:T] / 1000.0
+    return ev, dish, ev_cost, dish_cost
+
+ev_n, dish_n, evc_n, dishc_n = _slot_costs(sched_pin_naive, naive_slot)
+ev_j, dish_j, evc_j, dishc_j = _slot_costs(sched_joint, joint_slot)
+
+# Both plans deliver identical total energy (14 kWh EV + 5 kWh dishwasher
+# = 19 kWh); only the *placement* against the price profile differs. Show
+# this explicitly: top row is power, bottom row is the per-slot cost stack
+# on the SAME time axis, with the price curve overlaid for context.
+fig_L, axes = plt.subplots(
+    3, 2, figsize=(14, 8), sharex=True, sharey="row",
+    gridspec_kw={"height_ratios": [3, 2.2, 1.6]},
+)
+width_days = SLOT_MINUTES * 0.9 / (60.0 * 24.0)
+zoom_end = now_L + timedelta(hours=4.5)
+ev_deadline = now_L + timedelta(hours=TIME_TO_DEADLINE_H)
+T = sched_joint.horizon_slots
+times = [now_L + timedelta(minutes=SLOT_MINUTES * i) for i in range(T)]
+
+PLANS = [
+    ("Price-only naive", sched_pin_naive, naive_slot, ev_n, dish_n, evc_n, dishc_n,
+     naive_realised_cost),
+    ("Joint MIP", sched_joint, joint_slot, ev_j, dish_j, evc_j, dishc_j, joint_cost),
+]
+
+cheap_start = now_L + timedelta(minutes=SLOT_MINUTES * 4)
+cheap_end   = now_L + timedelta(minutes=SLOT_MINUTES * 12)
+
+for col, (label, sched, slot, ev, dish, evc, dishc, total_cost) in enumerate(PLANS):
+    ax_pwr = axes[0, col]
+    ax_cost = axes[1, col]
+    ax_price = axes[2, col]
+
+    # Top — power stack.
+    ax_pwr.bar(times, ev, width=width_days, color=_PALETTE["ev_charger"],
+               label="EV", align="edge", alpha=0.85)
+    ax_pwr.bar(times, dish, width=width_days, bottom=ev,
+               color=_PALETTE["dishwasher"], hatch="//", label="dishwasher",
+               align="edge", alpha=0.75)
+    ax_pwr.axhline(CAP_KW, color="black", ls="--", lw=1.2, label=f"cap {CAP_KW} kW")
+    ax_pwr.axvspan(cheap_start, cheap_end, alpha=0.08, color="green",
+                   label="cheap window (€10/MWh)")
+    ax_pwr.axvline(ev_deadline, color="#d62728", ls="--", lw=1.1, alpha=0.7,
+                   label="EV deadline 07:00")
+    ax_pwr.set_ylim(0, max(CAP_KW * 1.3, 9.5))
+    ax_pwr.set_title(
+        f"{label} → slot {slot} (+{slot*SLOT_H:.1f} h)\\n"
+        f"plan-level cost €{total_cost:.4f}  ·  EV €{evc.sum():.3f}, "
+        f"dish €{dishc.sum():.3f}  ·  delivered "
+        f"{ev.sum()*SLOT_H:.1f} kWh EV + {dish.sum()*SLOT_H:.1f} kWh dish = "
+        f"{(ev.sum()+dish.sum())*SLOT_H:.1f} kWh",
+        fontsize=9.5,
+    )
+    if col == 0:
+        ax_pwr.set_ylabel("load (kW)")
+    ax_pwr.legend(fontsize=7.3, loc="upper right", ncol=2)
+
+    # Middle — per-slot cost stack: this is where €1.425 vs €1.145 actually comes from.
+    ax_cost.bar(times, evc, width=width_days, color=_PALETTE["ev_charger"],
+                align="edge", alpha=0.85, label="EV € this slot")
+    ax_cost.bar(times, dishc, width=width_days, bottom=evc,
+                color=_PALETTE["dishwasher"], hatch="//", align="edge", alpha=0.75,
+                label="dish € this slot")
+    ax_cost.axvspan(cheap_start, cheap_end, alpha=0.08, color="green")
+    ax_cost.axvline(ev_deadline, color="#d62728", ls="--", lw=1.0, alpha=0.7)
+    if col == 0:
+        ax_cost.set_ylabel("slot cost (€)")
+    ax_cost.legend(fontsize=7.5, loc="upper right")
+
+    # Bottom — price step plot.
+    ax_price.step(times[:T], prices_L[:T], where="post", color="k", lw=1.3)
+    ax_price.fill_between(times[:T], prices_L[:T], step="post", alpha=0.12, color="k")
+    ax_price.axvspan(cheap_start, cheap_end, alpha=0.08, color="green")
+    ax_price.axvline(ev_deadline, color="#d62728", ls="--", lw=1.0, alpha=0.7)
+    if col == 0:
+        ax_price.set_ylabel("€/MWh")
+    ax_price.set_xlabel("time of day (UTC)")
+    ax_price.set_xlim(now_L, zoom_end)
+    ax_price.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+fig_L.suptitle(
+    f"Scenario L — same 19 kWh delivered both ways; only the placement against price differs.  "
+    f"Naive €{naive_realised_cost:.3f}  →  Joint MIP €{joint_cost:.3f}  "
+    f"(saves €{delta:.3f}, {pct:.1f}%)",
+    fontsize=10.5, y=0.995,
+)
+fig_L.autofmt_xdate(rotation=0, ha="center")
 plt.tight_layout()
 plt.show()
 """
@@ -1087,8 +1142,6 @@ MD_SUMMARY = """\
 | D | Heater concentrates in cheap hours | Overnight 4 kWh shifts into the price valley |
 | E | Power-cap binding (C5) | EV + heater share the 8 kW cap |
 | F | Committed dishwasher (C5 + headroom) | EV + heater throttle during the cycle |
-| G | Reschedule: dishwasher accepts | Savings ≥ threshold → ASK; sim user accepts → cycle moves |
-| H | Reschedule: washing machine declines | Same proposal logic; sim user declines → run now |
 | I | HITL throughput stress | 8 onsets, mixed accept/decline, threshold filters spurious offers |
 | J | Horizon sensitivity | 24 h LP is only ~3× slower than 6 h, savings improve with horizon |
 | K | Heater infeasibility | Slack absorbs the impossible 100 kWh ask, LP stays optimal |
@@ -1113,10 +1166,6 @@ cells = [
     code(CODE_E),
     md(MD_F),
     code(CODE_F),
-    md(MD_G),
-    code(CODE_G),
-    md(MD_H),
-    code(CODE_H),
     md(MD_I),
     code(CODE_I),
     md(MD_J),

@@ -73,7 +73,7 @@ def test_new_onset_suppressed_if_already_committed():
 def test_price_surprise_fires():
     tm = TriggerManager(price_deviation=0.25)
     tm.notify_replanned(NOW - timedelta(minutes=5))
-    sample = Sample(t=NOW, p_mains_w=500.0, realized_price=100.0)   # 2x forecast
+    sample = Sample(t=NOW, realized_price=100.0)   # 2x forecast
     out = tm.evaluate(
         now=NOW,
         latest_sample=sample,

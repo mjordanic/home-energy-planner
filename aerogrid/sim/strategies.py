@@ -2,53 +2,43 @@
 
 Architecture
 ------------
-Each strategy is a fully self-contained agent that owns ALL of its perception
-and planning machinery — its own NILM disaggregator, onset detectors,
-behavioural predictor, price oracle, MPC graph, etc. — built inside its own
-constructor. The digital twin owns only what is genuinely shared by the
-simulation environment:
+Each strategy is a self-contained agent that owns its own planning
+machinery (price oracle, MPC graph, …) and is fed by the digital twin
+with a uniform per-tick view of the simulation environment:
 
-  * the 1 Hz mains-power stream (:class:`ScenarioStreamer`),
-  * the realized-price server (:class:`PriceServer` — physical reality, not
-    a forecast),
-  * the queue of synthetic injected onsets used for stress testing.
+  * a 1 Hz tick stream (:class:`~aerogrid.sim.streamer.Streamer`)
+    carrying the realized price on slot boundaries,
+  * the same gated list of appliance onsets each tick.
 
 Per simulation tick, the digital twin hands every strategy
 
-  ``tick(sample, injected_onsets, dt_s=1.0)``
+  ``tick(sample, onsets, dt_s=1.0)``
 
-and lets each strategy decide what to do.  Strategies that need NILM
-disaggregation build it themselves; strategies that need forecasting build
-their own forecaster.  Different strategy instances can use different
-models — that's the whole point.
+and lets each strategy decide what to do.  Both strategies see the same
+onsets — there is no NILM in the loop, so the comparison is symmetric.
 
 Cross-strategy onset gating
 ---------------------------
 The only inter-strategy coordination happens upstream in the digital twin.
-For every synthetic INJECTED onset due at the current sample, the digital
-twin checks every strategy's :meth:`Strategy.has_pending_appliance` flag.
-If any strategy still has the appliance pending or running, the injected
-onset is suppressed.  Natural onsets perceived by each strategy's own
-machinery (e.g. the optimizer's NILM) are NOT gated — they're observations
-of physical reality and each strategy may legitimately disagree on whether
-a small power signature was a cycle start.
+For every onset due at the current sample, the digital twin checks every
+strategy's :meth:`Strategy.has_pending_appliance` flag.  If any strategy
+still has the appliance pending or running, the onset is suppressed for
+all strategies — preventing the same household appliance from being
+"started twice" while a previous cycle is still in flight.
 
 Concrete strategies
 -------------------
 :class:`BaselineStrategy`
-    Naive ASAP household.  Zero perception machinery — no NILM, no
-    forecaster, no predictor.  Just time-driven setpoints (EV charges at
-    rated power inside its window until full; heater runs at rated power
-    until each window's kWh requirement is met) and immediate cycle
-    starts on every gated injected onset.  Constructor takes nothing
-    beyond the strategy ``name``.
+    Naive ASAP household.  Time-driven setpoints (EV charges at rated
+    power inside its window until full; heater runs at rated power until
+    each window's kWh requirement is met) and immediate cycle starts on
+    every gated onset.
 
 :class:`OptimizerStrategy`
-    MPC + LangGraph + HITL gating.  Owns its own NILM, behavioural
-    predictor, price oracle, and compiled LangGraph; builds them all
-    inside its constructor from the high-level config.  Multiple
-    instances can be run side by side with different oracles or
-    predictors — each one is fully independent.
+    MPC + LangGraph + HITL gating.  Owns its own price oracle and compiled
+    LangGraph; both are built inside its constructor.  Multiple instances
+    can be run side by side with different oracles — each one is fully
+    independent.
 """
 from __future__ import annotations
 
@@ -60,7 +50,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from aerogrid.behavioral_predictor import load_onsets, make_predictor
 from aerogrid.commit import CommitTracker
 from aerogrid.config import (
     APPLIANCES,
@@ -69,13 +58,11 @@ from aerogrid.config import (
     EV_DEADLINE_HOUR,
     HEATER_DEADLINES,
     HITL_AUTO_RESPONSES,
-    SCENARIO_DIR,
     SHORT_HORIZON_SLOTS,
     SLOT_MINUTES,
     HeaterEnergyDeadline,
 )
 from aerogrid.graph import build_graph, make_thread_id as _default_make_thread_id
-from aerogrid.nilm import Disaggregator, OnsetDetector, RollingDisaggregator
 from aerogrid.price_oracle import make_oracle
 from aerogrid.triggers import TriggerManager
 from aerogrid.types import ApplianceOnset, Sample
@@ -209,28 +196,6 @@ def _jsonable(x: Any) -> Any:
     return str(x)
 
 
-def _build_nilm_components(
-    scenario_dir: Path,
-    split: str = "test",
-) -> tuple[RollingDisaggregator, dict[str, OnsetDetector]]:
-    """Build a fresh NILM stack: ``(rolling_disaggregator, detectors)``.
-
-    Module-private helper used by :class:`OptimizerStrategy`.  Each call
-    yields independent instances, so two OptimizerStrategy objects in the
-    same simulation get fully separate NILM state.
-    """
-    disagg = Disaggregator.from_scenario(scenario_dir, split=split)
-    rolling = RollingDisaggregator(disagg)
-    detectors = {
-        name: OnsetDetector(
-            appliance=name,
-            threshold_w=APPLIANCES[name].on_power_threshold_w,
-        )
-        for name in disagg.appliances()
-    }
-    return rolling, detectors
-
-
 # --------------------------------------------------------------------------- #
 # Strategy abstract base class                                                 #
 # --------------------------------------------------------------------------- #
@@ -246,11 +211,10 @@ class Strategy(ABC):
     Required:
 
     :meth:`tick`
-        Process one second.  Update internal state, react to gated injected
-        onsets, optionally perceive natural onsets via own machinery, emit
-        events.
+        Process one second.  Update internal state, react to gated onsets,
+        emit events.
     :meth:`has_pending_appliance`
-        Used by the digital twin to gate INJECTED onsets across strategies.
+        Used by the digital twin to gate onsets across strategies.
     :meth:`get_slot_record`
         Snapshot at a 15-min slot boundary; ALSO accrues this slot's cost.
 
@@ -272,11 +236,11 @@ class Strategy(ABC):
     def tick(
         self,
         sample: Sample,
-        injected_onsets: list[ApplianceOnset],
+        onsets: list[ApplianceOnset],
         *,
         dt_s: float = 1.0,
     ) -> None:
-        """Advance one second.  ``injected_onsets`` is already cross-strategy gated."""
+        """Advance one second.  ``onsets`` is already cross-strategy gated."""
 
     @abstractmethod
     def has_pending_appliance(self, appliance: str) -> bool:
@@ -314,20 +278,12 @@ class Strategy(ABC):
 # --------------------------------------------------------------------------- #
 
 class BaselineStrategy(Strategy):
-    """Naive ASAP household policy — zero perception machinery.
+    """Naive ASAP household policy — price-unaware time-driven setpoints.
 
-    No NILM, no forecaster, no predictor: this is a deliberately simple
-    reference policy.  EV charges at full rated power from plug-in until
-    the battery is full, then stops; heater runs at full rated power at
-    the start of each deadline window until that window's kWh requirement
-    is met; cycle appliances start immediately at every gated injected
-    onset.
-
-    Cycle onsets that are NOT in the injected stream are invisible to this
-    strategy.  In practice the demo scenarios drive cycles via injected
-    onsets only, so this is sufficient for a fair comparison; if you want
-    a baseline that perceives natural onsets via NILM, implement your own
-    Strategy subclass.
+    EV charges at full rated power from plug-in until the battery is full,
+    then stops; heater runs at full rated power at the start of each
+    deadline window until that window's kWh requirement is met; cycle
+    appliances start immediately at every gated onset.
 
     Construction is parameter-free apart from the strategy ``name``.
     """
@@ -380,7 +336,7 @@ class BaselineStrategy(Strategy):
     def tick(
         self,
         sample: Sample,
-        injected_onsets: list[ApplianceOnset],
+        onsets: list[ApplianceOnset],
         *,
         dt_s: float = 1.0,
     ) -> None:
@@ -457,8 +413,8 @@ class BaselineStrategy(Strategy):
                 detail="cycle duration elapsed",
             )
 
-        # --- React to gated injected onsets — start each cycle ASAP ------
-        for onset in injected_onsets:
+        # --- React to gated onsets — start each cycle ASAP ---------------
+        for onset in onsets:
             self._emit(
                 now, "onset_received",
                 appliance=onset.appliance,
@@ -548,25 +504,23 @@ class BaselineStrategy(Strategy):
 # --------------------------------------------------------------------------- #
 
 class OptimizerStrategy(Strategy):
-    """MPC + LangGraph + HITL — owns its NILM, predictor, oracle and graph.
+    """Model Predictive Control (MPC) + LangGraph + HITL — owns its price oracle 
+    and compiled graph.
 
     Construction
     ------------
     All optimizer-private machinery is built INSIDE the constructor:
 
-    * NILM disaggregator + per-appliance OnsetDetectors (from ``scenario_dir``),
     * price oracle (selected by ``price_oracle_impl``),
-    * behavioural predictor (fitted on ``load_onsets()``),
-    * compiled LangGraph (using all of the above + the SHARED
+    * compiled LangGraph (using the oracle + the SHARED
       ``price_history_provider`` from the digital twin's PriceServer).
 
-    The only external dependency you need to provide is
-    ``price_history_provider`` because the realized-price history is part
-    of the simulation environment, not a strategy choice.
+    The only external dependency is ``price_history_provider`` — realized
+    price history belongs to the simulation environment, not the strategy.
 
     Multiple OptimizerStrategy instances can be run side by side with
-    different ``price_oracle_impl`` values — each owns its own everything,
-    so there's no hidden cross-talk.
+    different ``price_oracle_impl`` values — each owns its own graph, so
+    there is no hidden cross-talk.
     """
 
     def __init__(
@@ -574,7 +528,6 @@ class OptimizerStrategy(Strategy):
         name: str = "optimizer",
         *,
         price_history_provider: Callable,
-        scenario_dir: Path = SCENARIO_DIR,
         price_oracle_impl: str = "naive",
         horizon_slots: int = SHORT_HORIZON_SLOTS,
         auto_confirm: bool = True,
@@ -589,15 +542,9 @@ class OptimizerStrategy(Strategy):
             else dict(HITL_AUTO_RESPONSES)
         )
 
-        # Build OWN NILM stack — the strategy's eyes on the mains signal.
-        self._nilm, self._detectors = _build_nilm_components(scenario_dir)
-
-        # Build OWN price oracle, behavioural predictor, and compiled graph.
         oracle = make_oracle(price_oracle_impl)
-        predictor = make_predictor().fit(load_onsets())
         builder, checkpointer = build_graph(
             price_oracle=oracle,
-            predictor=predictor,
             price_history_provider=price_history_provider,
             auto_confirm=auto_confirm,
             horizon_slots=horizon_slots,
@@ -673,17 +620,15 @@ class OptimizerStrategy(Strategy):
     def tick(
         self,
         sample: Sample,
-        injected_onsets: list[ApplianceOnset],
+        onsets: list[ApplianceOnset],
         *,
         dt_s: float = 1.0,
     ) -> None:
         """Process one second.
 
         1. Tick CommitTracker.
-        2. Run own NILM to disaggregate the sample and detect natural onsets.
-        3. Combine natural + (gated) injected onsets — these are what the
-           optimizer perceives.
-        4. Trigger evaluation; if it fires, run the slow-path graph and
+        2. Emit ``onset_received`` for each gated onset.
+        3. Trigger evaluation; if it fires, run the slow-path graph and
            adopt the resulting plan.
         """
         from langgraph.types import Command  # lazy
@@ -693,19 +638,7 @@ class OptimizerStrategy(Strategy):
         # 1. Advance commit-tracker state.
         self.commit.tick(now, dt_s)
 
-        # 2. NILM + onset detection (strategy-private).
-        self._nilm.append(sample.p_mains_w, now)
-        per_appliance = self._nilm.infer_latest(now)
-        natural_onsets: list[ApplianceOnset] = []
-        for app_name, p in per_appliance.items():
-            det = self._detectors.get(app_name)
-            if det is None:
-                continue
-            o = det.update(p, now)
-            if o is not None:
-                natural_onsets.append(o)
-        new_onsets = natural_onsets + list(injected_onsets)
-
+        new_onsets = list(onsets)
         for onset in new_onsets:
             self._emit(
                 now, "onset_received",
@@ -713,7 +646,7 @@ class OptimizerStrategy(Strategy):
                 detail=f"source={onset.source} confidence={onset.confidence:.2f}",
             )
 
-        # 3. Trigger evaluation.
+        # 2. Trigger evaluation.
         trigger = self.trig.evaluate(
             now=now,
             latest_sample=sample,
@@ -726,7 +659,7 @@ class OptimizerStrategy(Strategy):
         if trigger is None:
             return
 
-        # 4. Slow path — build state, run graph, adopt plan.
+        # 3. Slow path — build state, run graph, adopt plan.
         self._emit(
             now, "replan_triggered",
             detail=f"kind={trigger.kind} reason={trigger.detail!r}",
@@ -741,7 +674,6 @@ class OptimizerStrategy(Strategy):
         state_in = {
             "now": now,
             "latest_sample": sample,
-            "per_appliance_power_w": per_appliance,
             "new_onsets": [*new_onsets, *self.commit.replannable_onsets(now)],
             "committed_tasks": list(self.commit.running_committed_tasks(now)),
             "remaining_ev_kwh": self.commit.remaining_ev_kwh,
@@ -913,7 +845,6 @@ class OptimizerStrategy(Strategy):
             return
         entry = {
             "now": now.isoformat(),
-            "p_mains_w": sample.p_mains_w,
             "trigger": trigger.as_dict(),
             "hitl": _jsonable(result.get("hitl_decision")),
             "reschedule": _jsonable(proposal),

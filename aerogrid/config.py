@@ -29,20 +29,18 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
-SCENARIO_DIR = DATA_DIR / "scenario"
 NYISO_DIR = DATA_DIR / "nyiso"
 ENTSOE_DIR = DATA_DIR / "entsoe"
 SMARD_DIR = DATA_DIR / "smard"
 CACHE_DIR = DATA_DIR / "cache"
 
-for _d in (SCENARIO_DIR, NYISO_DIR, ENTSOE_DIR, SMARD_DIR, CACHE_DIR):
+for _d in (NYISO_DIR, ENTSOE_DIR, SMARD_DIR, CACHE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
     logger.debug("Ensured data directory exists: %s", _d)
 
 SLOTS_PER_DAY = 96
 SLOT_MINUTES = 15
 HOUSE_POWER_CAP_KW = 10.0
-SCENARIO_MAINS_HZ = 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -73,11 +71,9 @@ SMARD_TRAIN_END = _utc(2026, 4, 3)
 SMARD_TEST_START = _utc(2026, 4, 3)
 SMARD_TEST_END = _utc(2026, 4, 19)
 
-# Scenario — aligned with SMARD so the agent runs on real DE-LU prices.
-SCENARIO_TRAIN_START = SMARD_TRAIN_START
-SCENARIO_TRAIN_END = SMARD_TRAIN_END        # training days for behavioral predictor
-SCENARIO_TEST_START = SMARD_TEST_START
-SCENARIO_TEST_END = SMARD_TEST_END          # streaming-simulation days
+# Simulation window — aligned with SMARD so the agent runs on real DE-LU prices.
+SIM_TEST_START = SMARD_TEST_START
+SIM_TEST_END = SMARD_TEST_END               # streaming-simulation days
 
 
 # --------------------------------------------------------------------------- #
@@ -252,7 +248,6 @@ HITL_AUTO_RESPONSES: dict[str, str] = {
 # --------------------------------------------------------------------------- #
 PRICE_SOURCE = "smard"            # "smard" | "nyiso" | "entsoe"
 PRICE_ORACLE_IMPL = "naive"       # default flipped to 'naive' for zero-dep runs
-BEHAVIORAL_PREDICTOR_IMPL = "hybrid"
 
 
 # --------------------------------------------------------------------------- #
@@ -267,31 +262,19 @@ EVENT_LOG_PATH = CACHE_DIR / "event_log.parquet"
 
 
 # --------------------------------------------------------------------------- #
-# Simulation injections (digital twin only)                                   #
+# Simulation inputs (digital twin only)                                       #
 # --------------------------------------------------------------------------- #
-# Declarative knobs for deterministic stress tests.
-#
-# INJECTED_APPLIANCE_ONSETS:
-#   Sequence of (appliance_name, timestamp_utc) pairs. Each pair schedules a
-#   synthetic onset in ScenarioStreamer; the event then flows through the same
-#   trigger/graph path as naturally detected onsets.
+# APPLIANCE_ONSETS:
+#   Sequence of (appliance_name, timestamp_utc) pairs.  Each pair schedules an
+#   appliance onset on the streamer; both strategies see the same gated list.
 #
 # INJECTED_PRICE_SPIKES:
 #   Sequence of (timestamp_utc, delta_eur_per_mwh) pairs. At each timestamp's
 #   15-minute slot, the price server adds the delta on top of realized price.
 #
-# Leave either list empty to disable that injection path entirely.
-INJECTED_APPLIANCE_ONSETS: tuple[tuple[str, datetime], ...] = ()
+# Leave either list empty to disable that input.
+APPLIANCE_ONSETS: tuple[tuple[str, datetime], ...] = ()
 INJECTED_PRICE_SPIKES: tuple[tuple[datetime, float], ...] = ()
-
-# Risk-appetite multiplier on the ghost-reservation utility term in the MILP.
-# With dishwasher / washing machine moved out of the MILP into the event-driven
-# HITL path, this knob now only affects the (currently-empty) set of speculative
-# cycle starts the MILP can decide to schedule on its own. It is preserved as a
-# config knob so a future appliance can be re-introduced as a speculative load
-# without re-touching the optimiser. The default value of 0.5 is unchanged from
-# the cycle-aware era.
-RESERVATION_LAMBDA = 0.5
 
 
 def days_between(start: datetime, end: datetime) -> int:

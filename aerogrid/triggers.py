@@ -1,8 +1,8 @@
 """TriggerManager — decides when the outer (MPC) loop should fire.
 
-The inner 1 Hz loop runs disaggregation + commit-tracking on every sample.
-The outer loop (price forecast + behavioural prediction + MILP + HITL) is
-expensive, so we only fire it when one of a handful of conditions is met:
+The inner 1 Hz loop runs commit-tracking on every sample. The outer loop
+(price forecast + MILP + HITL) is expensive, so we only fire it when one
+of a handful of conditions is met:
 
 1. ``new_onset``      — an event-driven appliance fired that isn't already
                         running under a committed schedule. This is the
