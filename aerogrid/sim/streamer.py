@@ -1,119 +1,111 @@
-"""Replay UK-DALE test-slice data as a mock smart meter.
+"""Tick streamer — emits one ``Sample`` per simulated second with prices on slot boundaries.
 
-The streamer produces, per 15-min tick in the test window:
-  - a list of ground-truth ApplianceOnsets that occurred in the slot
-    (drawn from onsets.parquet so the graph always has *some* NILM signal,
-     even when 16 kHz data isn't available for that slot)
-  - optionally a (voltage, current) 16 kHz chunk if the slot overlaps the
-    3-day / 6-h 16 kHz FLAC slice — when present, the real SignalWatcher
-    runs in the graph.
+The streamer no longer reads any parquet trace.  Each call to
+:meth:`iter_samples` walks ``[start, end)`` at 1 Hz and yields a
+:class:`~aerogrid.types.Sample` whose ``realized_price`` is populated only on
+15-min slot boundaries (the price comes from the
+:class:`~aerogrid.sim.price_server.PriceServer` provider).
+
+Appliance onsets are *injected* manually via :meth:`add_onset` and consumed by
+the digital twin once per tick via :meth:`consume_injected_onsets`.  The
+streamer is the only entry-point for onsets — there is no "natural" onset
+detection because the simulator no longer carries a synthetic mains trace.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
-import numpy as np
-import pandas as pd
+from aerogrid.config import SLOT_MINUTES
+from aerogrid.types import ApplianceOnset, Sample
 
-from aerogrid.behavioral_predictor import load_onsets
-from aerogrid.config import (
-    SLOT_MINUTES,
-    UKDALE_16KHZ_END,
-    UKDALE_16KHZ_START,
-    UKDALE_DIR,
-    UKDALE_HF_HZ,
-    UKDALE_TEST_END,
-    UKDALE_TEST_START,
-)
-from aerogrid.types import ApplianceOnset
+logger = logging.getLogger(__name__)
+
+
+def _slot_floor(t: datetime) -> datetime:
+    """Round ``t`` down to the start of its 15-min slot (zeroes seconds/μs)."""
+    return t.replace(
+        minute=(t.minute // SLOT_MINUTES) * SLOT_MINUTES,
+        second=0,
+        microsecond=0,
+    )
 
 
 @dataclass
-class Tick:
-    now: datetime
-    new_onsets: list[ApplianceOnset]
-    mains_chunk: tuple[np.ndarray, np.ndarray] | None
-    chunk_start: datetime | None
-
-
 class Streamer:
-    """Iterate the test window at 15-min cadence."""
+    """Generate 1 Hz simulation ticks and queue manually injected onsets."""
+    realized_price_provider: Callable[[datetime], float | None] | None = None
+    _injected_onsets: list[ApplianceOnset] = field(default_factory=list)
 
-    def __init__(self, flac_path: Path | None = None):
-        self.onsets = load_onsets()
-        self.test_onsets = self.onsets[self.onsets["split"] == "test"].copy()
-        self.test_onsets["timestamp"] = self.test_onsets["timestamp"].dt.tz_convert("UTC")
-
-        self._flac_path = flac_path or (UKDALE_DIR / "house_1" / "mains_16khz_3day.flac")
-        self._flac_cache: tuple[np.ndarray, np.ndarray, int, datetime] | None = None
-
-    def _load_flac(self):
-        if not self._flac_path.exists():
-            return None
-        if self._flac_cache is not None:
-            return self._flac_cache
-        import soundfile as sf
-        data, fs = sf.read(self._flac_path, always_2d=True)
-        voltage = data[:, 0] * 300.0
-        current = data[:, 1] * 15.0
-        self._flac_cache = (voltage.astype(np.float32),
-                            current.astype(np.float32), int(fs),
-                            UKDALE_16KHZ_START)
-        return self._flac_cache
-
-    # ------------------------------------------------------------------ #
-    def iter_ticks(
+    def add_onset(
         self,
-        start: datetime | None = None,
-        end: datetime | None = None,
-        hf_every_n_ticks: int = 24,          # 1x per 6 h by default
-    ) -> Iterator[Tick]:
-        start = start or UKDALE_TEST_START
-        end = end or UKDALE_TEST_END
-        tick_dt = timedelta(minutes=SLOT_MINUTES)
+        appliance: str,
+        timestamp: datetime,
+        confidence: float = 1.0,
+    ) -> None:
+        """Queue an :class:`ApplianceOnset` for emission at ``timestamp``."""
+        onset = ApplianceOnset(
+            appliance=appliance,
+            timestamp=timestamp,
+            confidence=float(confidence),
+            source="injected",
+        )
+        self._injected_onsets.append(onset)
+        self._injected_onsets.sort(key=lambda o: o.timestamp)
+        logger.info(
+            "Streamer.add_onset: queued appliance=%s at=%s",
+            appliance, timestamp.isoformat(),
+        )
 
-        now = start
-        idx = 0
-        while now < end:
-            slot_end = now + tick_dt
-            mask = (
-                (self.test_onsets["timestamp"] >= now)
-                & (self.test_onsets["timestamp"] < slot_end)
+    def consume_injected_onsets(self, now: datetime) -> list[ApplianceOnset]:
+        """Pop and return all injected onsets whose timestamp is ≤ ``now``."""
+        ready: list[ApplianceOnset] = []
+        while self._injected_onsets and self._injected_onsets[0].timestamp <= now:
+            ready.append(self._injected_onsets.pop(0))
+        if ready:
+            logger.debug(
+                "Streamer.consume_injected_onsets: emitting %d onset(s) at=%s",
+                len(ready), now.isoformat(),
             )
-            onsets: list[ApplianceOnset] = []
-            for _, row in self.test_onsets[mask].iterrows():
-                onsets.append(
-                    ApplianceOnset(
-                        appliance=row["appliance"],
-                        timestamp=row["timestamp"].to_pydatetime(),
-                        confidence=1.0,
-                        source="ground_truth",
-                    )
+        return ready
+
+    def iter_samples(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> Iterator[Sample]:
+        """Yield one :class:`~aerogrid.types.Sample` per simulated second.
+
+        The first sample of each 15-min slot carries a non-``None``
+        ``realized_price`` from ``realized_price_provider``; all other
+        samples in the slot have ``realized_price=None``.
+        """
+        logger.info(
+            "Streamer.iter_samples: window %s → %s",
+            start.isoformat(), end.isoformat(),
+        )
+        provider = self.realized_price_provider
+        last_slot: datetime | None = None
+        n_slots = 0
+        t = start
+        step = timedelta(seconds=1)
+        while t < end:
+            slot = _slot_floor(t)
+            realized: float | None = None
+            if slot != last_slot:
+                realized = provider(slot) if provider is not None else None
+                last_slot = slot
+                n_slots += 1
+                logger.debug(
+                    "Streamer: new slot boundary slot=%s realized_price=%s",
+                    slot.isoformat(),
+                    f"{realized:.2f}" if realized is not None else "None",
                 )
+            yield Sample(t=t, realized_price=realized)
+            t = t + step
+        logger.info("Streamer.iter_samples: finished streaming %d slots", n_slots)
 
-            chunk = None
-            chunk_t = None
-            hf = self._load_flac()
-            if hf is not None and (idx % hf_every_n_ticks == 0):
-                voltage, current, fs, flac_start = hf
-                # Grab the slot's worth of HF if it's inside the FLAC window.
-                if UKDALE_16KHZ_START <= now < UKDALE_16KHZ_END:
-                    rel = (now - flac_start).total_seconds()
-                    n_samples = fs * SLOT_MINUTES * 60
-                    s0 = int(rel * fs)
-                    s1 = s0 + n_samples
-                    if 0 <= s0 and s1 <= len(voltage):
-                        chunk = (voltage[s0:s1], current[s0:s1])
-                        chunk_t = now
 
-            yield Tick(
-                now=now,
-                new_onsets=onsets,
-                mains_chunk=chunk,
-                chunk_start=chunk_t,
-            )
-            now = slot_end
-            idx += 1
+__all__ = ["Streamer"]

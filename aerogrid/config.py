@@ -1,44 +1,55 @@
 """Static configuration for AeroGrid.
 
-All date windows, appliance specs, paths and model selection live here so that
-scripts, notebooks and the digital twin all agree on the same split.
+Date windows, appliance specs, paths, and model/horizon/trigger/HITL tuning
+all live here so scripts, notebooks, and the digital twin agree on the same
+constants.
+
+After the *intent-driven* refactor of April 2026, the optimizer treats two
+loads as continuous variable-power and the rest as event-driven:
+
+* **EV charger** — continuous power, hard energy deadline at 07:00 UTC,
+  hard availability gate (no charging before :data:`EV_AVAILABLE_FROM_HOUR`).
+* **Heater** — continuous power, multiple energy windows specified in
+  :data:`HEATER_DEADLINES`. Each window has its own kWh target.
+* **Dishwasher / washing machine** — *event-driven*. The user starts them;
+  the agent only proposes a *small reschedule* (≤ :data:`HITL_RESCHEDULE_WINDOW_HOURS`
+  hours forward) if it would save more than
+  :data:`HITL_RESCHEDULE_MIN_SAVINGS_EUR`. Whether the simulated user
+  accepts is per-appliance and lives in :data:`HITL_AUTO_RESPONSES`.
+* **Fridge** — always-on background load, never scheduled.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import logging
+from dataclasses import dataclass
+from datetime import datetime, time, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
-UKDALE_DIR = DATA_DIR / "ukdale"
 NYISO_DIR = DATA_DIR / "nyiso"
 ENTSOE_DIR = DATA_DIR / "entsoe"
+SMARD_DIR = DATA_DIR / "smard"
 CACHE_DIR = DATA_DIR / "cache"
 
-for _d in (UKDALE_DIR, NYISO_DIR, ENTSOE_DIR, CACHE_DIR):
+for _d in (NYISO_DIR, ENTSOE_DIR, SMARD_DIR, CACHE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+    logger.debug("Ensured data directory exists: %s", _d)
 
 SLOTS_PER_DAY = 96
 SLOT_MINUTES = 15
 HOUSE_POWER_CAP_KW = 10.0
 
+
 # --------------------------------------------------------------------------- #
-# Date windows                                                                #
+# Date windows (all UTC)                                                       #
 # --------------------------------------------------------------------------- #
 def _utc(y: int, m: int, d: int) -> datetime:
+    """Construct a timezone-aware UTC :class:`~datetime.datetime` at midnight."""
     return datetime(y, m, d, tzinfo=timezone.utc)
 
-# UK-DALE House 1 — 60 days inside the well-instrumented 2014 window.
-UKDALE_TRAIN_START = _utc(2014, 10, 1)
-UKDALE_TRAIN_END = _utc(2014, 11, 16)      # 46 train days
-UKDALE_TEST_START = _utc(2014, 11, 16)
-UKDALE_TEST_END = _utc(2014, 11, 30)       # 14 test days
-# 6-hour 16 kHz FLAC slice inside the test window (for DWT demo only).
-# A full 3-day slice would be ~8 GB stereo at 16 kHz; 6 h gives enough onsets
-# (~2–4 per appliance) to visualise without eating disk.
-UKDALE_16KHZ_START = datetime(2014, 11, 16, 18, tzinfo=timezone.utc)
-UKDALE_16KHZ_END = datetime(2014, 11, 17, 0, tzinfo=timezone.utc)
 
 # NYISO — 90 days, last 14 reserved for simulation.
 NYISO_TRAIN_START = _utc(2024, 10, 1)
@@ -47,109 +58,227 @@ NYISO_TEST_START = _utc(2024, 12, 16)
 NYISO_TEST_END = _utc(2024, 12, 30)        # 14 test days
 NYISO_ZONE = "N.Y.C."                      # matches NYISO CSV zone name
 
-# ENTSO-E DE-LU (optional alt path).
+# ENTSO-E DE-LU (optional alt path — requires ENTSOE_API_KEY).
 ENTSOE_TRAIN_START = _utc(2024, 12, 1)
 ENTSOE_TRAIN_END = _utc(2024, 12, 21)      # 20 train days
 ENTSOE_TEST_START = _utc(2024, 12, 21)
 ENTSOE_TEST_END = _utc(2024, 12, 31)       # 10 test days
 ENTSOE_AREA = "DE_LU"
 
+# SMARD DE-LU — free, no key, 15-min native, primary EU price source.
+SMARD_TRAIN_START = _utc(2026, 1, 12)
+SMARD_TRAIN_END = _utc(2026, 4, 3)
+SMARD_TEST_START = _utc(2026, 4, 3)
+SMARD_TEST_END = _utc(2026, 4, 19)
+
+# Simulation window — aligned with SMARD so the agent runs on real DE-LU prices.
+SIM_TEST_START = SMARD_TEST_START
+SIM_TEST_END = SMARD_TEST_END               # streaming-simulation days
+
+
 # --------------------------------------------------------------------------- #
-# Appliances (UK-DALE House 1 channel map + modelled EV)                      #
+# Appliances (simulator-driven; no dataset channel numbers)                   #
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ApplianceSpec:
+    """Static description of one appliance.
+
+    ``cycle_slots`` is non-zero only for *event-driven cycle appliances*
+    (dishwasher, washing machine) — appliances the user starts and that
+    run a fixed-shape cycle of known length and rated power. The continuous
+    loads (EV, heater) and the always-on fridge use ``cycle_slots = 0``;
+    their behaviour is modelled by their own dedicated MILP variables
+    (EV / heater) or as constant background load (fridge).
+    """
     name: str
-    ukdale_channel: int | None   # None => synthetic (EV)
     rated_kw: float
-    cycle_slots: int             # number of 15-min slots a cycle occupies
+    cycle_slots: int             # 0 for continuous / always-on loads
     on_power_threshold_w: float
     max_power_w: float
-    bufferable: bool             # True => MILP may shift this load in time
+    bufferable: bool             # True => MILP / HITL may shift this load
+
+
+@dataclass(frozen=True)
+class HeaterEnergyDeadline:
+    """One energy delivery deadline for the heater.
+
+    The heater must have delivered ``kwh_required`` kWh of heating energy
+    by hour ``hour:00`` UTC. The window the energy is integrated over
+    runs from the *previous* deadline (circular over 24 h) up to and
+    including ``hour:00``. Example: with ``HEATER_DEADLINES`` = (7, 18),
+    the 07:00 deadline integrates over 18:00 → 07:00 (overnight, 13 h)
+    and the 18:00 deadline integrates over 07:00 → 18:00 (daytime, 11 h).
+    """
+    hour: int                    # UTC hour by which the energy must be delivered
+    kwh_required: float          # kWh required in the window ending at this hour
+
 
 APPLIANCES: dict[str, ApplianceSpec] = {
     "dishwasher": ApplianceSpec(
         name="dishwasher",
-        ukdale_channel=6,
         rated_kw=2.5,
-        cycle_slots=8,                 # ~2 hours
+        cycle_slots=8,                 # ~2 hours fixed-shape cycle
         on_power_threshold_w=20.0,
         max_power_w=2500.0,
         bufferable=True,
     ),
     "washing_machine": ApplianceSpec(
         name="washing_machine",
-        ukdale_channel=5,
         rated_kw=2.4,
-        cycle_slots=6,                 # ~1.5 hours
+        cycle_slots=6,                 # ~1.5 hours fixed-shape cycle
         on_power_threshold_w=20.0,
         max_power_w=2400.0,
         bufferable=True,
     ),
     "ev_charger": ApplianceSpec(
         name="ev_charger",
-        ukdale_channel=None,           # not present in UK-DALE; purely modelled
         rated_kw=7.0,
-        cycle_slots=0,                 # continuous, not cycle-based
+        cycle_slots=0,                 # continuous, MILP-controlled
         on_power_threshold_w=50.0,
         max_power_w=7000.0,
         bufferable=True,
     ),
+    # Heater: continuous variable power, controlled by the MILP, with one
+    # or more energy-delivery deadlines per day (see HEATER_DEADLINES).
+    # The MILP can run the heater at any non-negative power up to rated_kw
+    # at every slot; what matters is the integral over each deadline window.
+    "heater": ApplianceSpec(
+        name="heater",
+        rated_kw=2.0,
+        cycle_slots=0,                 # continuous, no fixed-shape cycle
+        on_power_threshold_w=30.0,
+        max_power_w=2000.0,
+        bufferable=True,
+    ),
+    # Fridge: always-on compressor cycling — not schedulable by the MILP.
+    # Adds realistic MinMax background noise to the aggregate trace.
+    "fridge": ApplianceSpec(
+        name="fridge",
+        rated_kw=0.15,
+        cycle_slots=0,                 # always-on baseline
+        on_power_threshold_w=10.0,
+        max_power_w=150.0,
+        bufferable=False,
+    ),
 }
 
-# EV daily need (kWh by 07:00 local) — used as MILP comfort constraint.
+
+# --------------------------------------------------------------------------- #
+# EV charging                                                                  #
+# --------------------------------------------------------------------------- #
 EV_DAILY_NEED_KWH = 24.0
-EV_DEADLINE_SLOT = 28            # 07:00 in 15-min slots (07 * 4)
+EV_DEADLINE_HOUR = 7              # 07:00 UTC — kWh must be delivered by this time
+# Earliest UTC hour at which the EV is plugged in and charging is allowed.
+# Until this hour each day, p_ev[t] is forced to zero by the MILP and by the
+# fallback policy. The scenario simulator schedules the EV plug-in event at
+# exactly this hour to keep the streaming twin and the optimizer in sync.
+EV_AVAILABLE_FROM_HOUR = 20
+
+
+# --------------------------------------------------------------------------- #
+# Heater                                                                       #
+# --------------------------------------------------------------------------- #
+# Energy comfort deadlines for the heater. Each entry's ``kwh_required`` must
+# be delivered in the window ending at ``hour:00`` UTC; the window starts at
+# the previous deadline (circular over 24 h). With the defaults below:
+#   * 07:00 deadline → 4 kWh integrated over 18:00 → 07:00 (overnight)
+#   * 18:00 deadline → 2 kWh integrated over 07:00 → 18:00 (daytime)
+HEATER_DEADLINES: tuple[HeaterEnergyDeadline, ...] = (
+    HeaterEnergyDeadline(hour=7, kwh_required=4.0),
+    HeaterEnergyDeadline(hour=18, kwh_required=2.0),
+)
+
+
+# --------------------------------------------------------------------------- #
+# MPC horizon                                                                 #
+# --------------------------------------------------------------------------- #
+# Length of the receding-horizon optimisation in hours. The MILP is re-solved
+# every TRIGGER_RESYNC_MINUTES (or on event triggers), and only the first
+# slot's setpoints are committed before the next replan, so this is a true
+# rolling horizon. 24 h is the default because the heater energy windows can
+# span up to 13 h and we want at least one full window in view at all times.
+HORIZON_HOURS = 24
+SHORT_HORIZON_SLOTS = HORIZON_HOURS * (60 // SLOT_MINUTES)   # 24 h × 4 slots/h = 96
+# Forecast horizon must be at least the optimisation horizon. The seasonal-naive
+# oracle pads to whatever length is requested; the Chronos / GridFM oracles
+# fall back to seasonal if they can't produce 96 slots.
+FORECAST_HORIZON_SLOTS = SHORT_HORIZON_SLOTS
+
+
+# --------------------------------------------------------------------------- #
+# Trigger thresholds (when does the outer loop fire?)                         #
+# --------------------------------------------------------------------------- #
+TRIGGER_COOLDOWN_S = 30.0         # min seconds between successive replans
+TRIGGER_RESYNC_MINUTES = 15       # periodic replan regardless of events
+# Price deviation (relative) above which to replan.
+REPLAN_PRICE_DEVIATION = 0.25
+# Approaching-commit: replan within N minutes of a tentative task's planned start.
+TRIGGER_COMMIT_LOOKAHEAD_MIN = 5
+# Deadline-guard: replan if required_rate / current_rate > this ratio.
+TRIGGER_DEADLINE_SAFETY = 1.2
+
+
+# --------------------------------------------------------------------------- #
+# HITL policy tolerances (AUTO vs ASK) and reschedule offers                  #
+# --------------------------------------------------------------------------- #
+HITL_EV_TOLERANCE_KW = 1.5        # EV power change within this → AUTO
+HITL_SHIFT_TOLERANCE_MIN = 15     # tentative-task shift within this → AUTO
+HITL_ASK_SHIFT_MIN = 30           # shift beyond this → ASK
+HITL_COST_BUMP_USD = 0.50         # cost-increasing deadline-guard → ASK
+SLEEP_WINDOW_START = time(22, 0)  # any start crossing into 22–06 → ASK
+SLEEP_WINDOW_END = time(6, 0)
+
+# Reschedule proposals for event-driven cycle appliances (dishwasher,
+# washing machine). When the user starts the appliance, the agent searches
+# for a cheaper start time within the next HITL_RESCHEDULE_WINDOW_HOURS hours
+# and offers the shift to the user iff the savings exceed
+# HITL_RESCHEDULE_MIN_SAVINGS_EUR. In simulation, HITL_AUTO_RESPONSES decides
+# the simulated user's reply per appliance ("accept" runs at proposed time,
+# "decline" runs immediately at the original onset time).
+HITL_RESCHEDULE_WINDOW_HOURS = 2.0
+HITL_RESCHEDULE_MIN_SAVINGS_EUR = 0.10
+HITL_AUTO_RESPONSES: dict[str, str] = {
+    "dishwasher": "accept",
+    "washing_machine": "decline",
+}
+
 
 # --------------------------------------------------------------------------- #
 # Model selection                                                             #
 # --------------------------------------------------------------------------- #
-# Which price oracle implementation to use. Options:
-#   "gridfm"   — primary, physics-informed (asayghe1/GridFM, NYISO)
-#   "chronos"  — Chronos-2 zero-shot (any market)
-#   "naive"    — seasonal-naive fallback
-PRICE_ORACLE_IMPL = "gridfm"
+PRICE_SOURCE = "smard"            # "smard" | "nyiso" | "entsoe"
+PRICE_ORACLE_IMPL = "naive"       # default flipped to 'naive' for zero-dep runs
 
-# Which behavioral predictor to use.
-#   "hybrid"   — logistic(hour, dow) + Gaussian KDE (default)
-#   "chronos"  — Chronos-2 over binned onset counts (alt)
-#   "mamba"    — Mamba-3 stub (NotImplementedError)
-BEHAVIORAL_PREDICTOR_IMPL = "hybrid"
 
 # --------------------------------------------------------------------------- #
-# Signature matching / NILM                                                   #
-# --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class NILMConfig:
-    wavelet: str = "db4"
-    dwt_level: int = 4
-    onset_energy_threshold: float = 3.0   # z-score of D1+D2 rolling energy
-    min_onset_gap_s: float = 15.0         # debounce
-    vi_trajectory_points: int = 64        # resample each V-I cycle to this grid
-    signature_match_threshold: float = 0.75
-
-NILM = NILMConfig()
-
-# --------------------------------------------------------------------------- #
-# LangGraph / HITL                                                            #
+# LangGraph / HITL / logging                                                  #
 # --------------------------------------------------------------------------- #
 GRAPH_CHECKPOINT_DB = CACHE_DIR / "graph_state.sqlite"
 RUN_LOG_PATH = CACHE_DIR / "run_log.jsonl"
+# Per-15-min slot comparison between baseline and optimizer (strategies.py).
+SLOT_LOG_PATH = CACHE_DIR / "slot_log.parquet"
+# Per-event decision log at 1-second resolution for both strategies.
+EVENT_LOG_PATH = CACHE_DIR / "event_log.parquet"
 
-# Price deviation (relative) above which the monitor triggers a replan.
-REPLAN_PRICE_DEVIATION = 0.25
-
-# Risk-appetite multiplier on the ghost-reservation utility term in the MILP.
-# Higher = we trust the behavioral predictor more and reserve harder.
-RESERVATION_LAMBDA = 0.5
 
 # --------------------------------------------------------------------------- #
-# Sampling rates                                                              #
+# Simulation inputs (digital twin only)                                       #
 # --------------------------------------------------------------------------- #
-UKDALE_MAINS_HZ = 1.0
-UKDALE_SUBMETER_PERIOD_S = 6.0
-UKDALE_HF_HZ = 16_000.0
+# APPLIANCE_ONSETS:
+#   Sequence of (appliance_name, timestamp_utc) pairs.  Each pair schedules an
+#   appliance onset on the streamer; both strategies see the same gated list.
+#
+# INJECTED_PRICE_SPIKES:
+#   Sequence of (timestamp_utc, delta_eur_per_mwh) pairs. At each timestamp's
+#   15-minute slot, the price server adds the delta on top of realized price.
+#
+# Leave either list empty to disable that input.
+APPLIANCE_ONSETS: tuple[tuple[str, datetime], ...] = ()
+INJECTED_PRICE_SPIKES: tuple[tuple[datetime, float], ...] = ()
 
 
 def days_between(start: datetime, end: datetime) -> int:
-    return (end - start).days
+    """Return the number of whole days between two UTC datetimes."""
+    result = (end - start).days
+    logger.debug("days_between(%s, %s) = %d", start.date(), end.date(), result)
+    return result

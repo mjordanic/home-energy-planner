@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +35,10 @@ from aerogrid.config import (
     NYISO_TRAIN_START,
     NYISO_ZONE,
 )
+from aerogrid.logging_config import setup_logging
 from scripts._common import FetchError, http_get, write_manifest
+
+logger = logging.getLogger(__name__)
 
 NYISO_RT_URL = "https://mis.nyiso.com/public/csv/realtime/{ymd}realtime_zone.csv"
 NYISO_DAM_URL = "https://mis.nyiso.com/public/csv/damlbmp/{ymd}damlbmp_zone.csv"
@@ -46,17 +50,27 @@ NYISO_DAM_URL = "https://mis.nyiso.com/public/csv/damlbmp/{ymd}damlbmp_zone.csv"
 def _try_fetch_real(zone: str, start: datetime, end: datetime
                     ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Download per-day CSVs and concatenate. Raises FetchError on any failure."""
+    n_days = (end - start).days
+    logger.info("_try_fetch_real: fetching NYISO zone=%s for %d days (%s → %s)", zone, n_days, start.date(), end.date())
     rt_frames: list[pd.DataFrame] = []
     dam_frames: list[pd.DataFrame] = []
     day = start
+    day_num = 0
     while day < end:
         ymd = day.strftime("%Y%m%d")
+        day_num += 1
+        logger.debug("_try_fetch_real: day %d/%d %s", day_num, n_days, ymd)
         try:
             r_rt = http_get(NYISO_RT_URL.format(ymd=ymd), timeout=15)
             r_dam = http_get(NYISO_DAM_URL.format(ymd=ymd), timeout=15)
         except Exception as e:
+            logger.error("_try_fetch_real: network error on %s: %s", ymd, e)
             raise FetchError(f"NYISO network error on {ymd}: {e}") from e
         if r_rt.status_code != 200 or r_dam.status_code != 200:
+            logger.error(
+                "_try_fetch_real: HTTP error on %s RT=%d DAM=%d",
+                ymd, r_rt.status_code, r_dam.status_code,
+            )
             raise FetchError(f"NYISO HTTP {r_rt.status_code}/{r_dam.status_code} on {ymd}")
         rt_frames.append(pd.read_csv(io.StringIO(r_rt.text)))
         dam_frames.append(pd.read_csv(io.StringIO(r_dam.text)))
@@ -105,10 +119,17 @@ def _tag_split(df: pd.DataFrame) -> pd.DataFrame:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--zone", default=NYISO_ZONE)
+    ap.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
     args = ap.parse_args()
 
-    print(f"downloading NYISO prices for zone={args.zone}, "
-          f"{NYISO_TRAIN_START.date()}..{NYISO_TEST_END.date()}")
+    setup_logging(level=getattr(logging, args.log_level, logging.INFO), console=True)
+    logger.info(
+        "fetch_nyiso_prices: zone=%s %s → %s",
+        args.zone, NYISO_TRAIN_START.date(), NYISO_TEST_END.date(),
+    )
     rt, dam = _try_fetch_real(args.zone, NYISO_TRAIN_START, NYISO_TEST_END)
 
     rt_15 = _tag_split(_aggregate_15min(rt))
@@ -153,7 +174,9 @@ def main() -> int:
             },
         },
     )
-    print("done.")
+    logger.info(
+        "fetch_nyiso_prices: done rt_15=%d dam=%d", len(rt_15), len(dam_tagged),
+    )
     return 0
 
 

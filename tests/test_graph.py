@@ -1,55 +1,24 @@
-"""Tests for LangGraph assembly + HITL interrupt / resume."""
+"""Tests for LangGraph assembly + HITL interrupt/resume on the slow path."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 from langgraph.types import Command
 
-from aerogrid.behavioral_predictor import HybridBehavioralPredictor
-from aerogrid.config import APPLIANCES
 from aerogrid.graph import build_graph, make_thread_id
 from aerogrid.price_oracle import SeasonalNaiveOracle
-from aerogrid.signal_watcher import SignalWatcher
-from aerogrid.types import ApplianceOnset
+from aerogrid.types import Schedule
 
 
 # --------------------------------------------------------------------------- #
 # fixtures                                                                    #
 # --------------------------------------------------------------------------- #
 @pytest.fixture
-def fake_onsets() -> pd.DataFrame:
-    """Plausible sparse onset log spanning 40 training days + 14 test."""
-    rng = np.random.default_rng(0)
-    rows = []
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    for d in range(40):
-        for app, peak_h in [("dishwasher", 21), ("washing_machine", 9)]:
-            h = int(np.clip(rng.normal(peak_h, 2), 0, 23))
-            rows.append({
-                "appliance": app,
-                "timestamp": base + timedelta(days=d, hours=h),
-                "split": "train",
-            })
-    for d in range(40, 54):
-        for app, peak_h in [("dishwasher", 21), ("washing_machine", 9)]:
-            h = int(np.clip(rng.normal(peak_h, 2), 0, 23))
-            rows.append({
-                "appliance": app,
-                "timestamp": base + timedelta(days=d, hours=h),
-                "split": "test",
-            })
-    df = pd.DataFrame(rows)
-    df["split"] = df["split"].astype("category")
-    return df
-
-
-@pytest.fixture
 def fake_prices() -> pd.DataFrame:
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2024, 10, 1, tzinfo=timezone.utc)
     idx = pd.date_range(base, periods=54 * 96, freq="15min", tz="UTC")
     rng = np.random.default_rng(0)
     hod = idx.hour + idx.minute / 60
@@ -57,104 +26,85 @@ def fake_prices() -> pd.DataFrame:
     return pd.DataFrame({"timestamp": idx, "lbmp": lbmp.astype(np.float32)})
 
 
-# --------------------------------------------------------------------------- #
-# tests                                                                       #
-# --------------------------------------------------------------------------- #
 def _providers(prices_df: pd.DataFrame):
     def hist(now):
         return prices_df[prices_df["timestamp"] < now]
-
-    def realized(now):
-        floor = (now.minute // 15) * 15
-        slot = now.replace(minute=floor, second=0, microsecond=0)
-        row = prices_df[prices_df["timestamp"] == slot]
-        return float(row["lbmp"].iloc[0]) if not row.empty else None
-
-    return hist, realized
+    return hist
 
 
-def test_graph_compiles_and_runs_once(fake_onsets, fake_prices):
-    hist, realized = _providers(fake_prices)
-    predictor = HybridBehavioralPredictor().fit(fake_onsets)
+def _base_state(now: datetime, *, remaining_ev_kwh: float = 24.0) -> dict:
+    return {
+        "now": now,
+        "committed_tasks": [],
+        "remaining_ev_kwh": remaining_ev_kwh,
+        "ev_power_setpoint_kw": 0.0,
+        "previous_plan": None,
+        "event_log": [],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# tests                                                                       #
+# --------------------------------------------------------------------------- #
+def test_graph_compiles_and_runs_once(fake_prices):
+    hist = _providers(fake_prices)
     builder, checkpointer = build_graph(
-        watcher=SignalWatcher(signatures={}),
         price_oracle=SeasonalNaiveOracle(),
-        predictor=predictor,
         price_history_provider=hist,
-        realized_price_provider=realized,
         auto_confirm=True,
     )
     graph = builder.compile(checkpointer=checkpointer)
-    now = datetime(2026, 2, 10, 0, 0, tzinfo=timezone.utc)   # in test window
-    state = {
-        "now": now,
-        "mains_chunk": None,
-        "chunk_start": None,
-        "recent_onsets": [],
-        "realized_prices": [],
-        "event_log": [],
-        "cumulative_cost": 0.0,
-        "cumulative_baseline_cost": 0.0,
-        "iteration": 0,
-    }
+    # Pick a moment 5 h before the deadline so the EV must charge inside a 2 h horizon.
+    now = datetime(2024, 11, 20, 2, 0, tzinfo=timezone.utc)
+    state = _base_state(now)
     cfg = {"configurable": {"thread_id": make_thread_id(now)}}
     result = graph.invoke(state, config=cfg)
-    assert result["iteration"] == 1
-    assert result["schedule"] is not None
-    assert result["schedule"].solver_status in ("optimal", "optimal_inaccurate")
-    assert len(result["schedule"].tasks) == 2    # dishwasher + washing_machine
+    plan = result["current_plan"]
+    assert isinstance(plan, Schedule)
+    assert plan.solver_status in ("optimal", "optimal_inaccurate")
+    assert plan.horizon_slots > 0
+    assert len(plan.ev_power_kw) == plan.horizon_slots
 
 
-def test_interrupt_resumes_with_user_answer(fake_onsets, fake_prices):
-    hist, realized = _providers(fake_prices)
-    predictor = HybridBehavioralPredictor().fit(fake_onsets)
+def test_first_plan_interrupts_when_auto_confirm_off(fake_prices):
+    hist = _providers(fake_prices)
     builder, checkpointer = build_graph(
-        watcher=SignalWatcher(signatures={}),
         price_oracle=SeasonalNaiveOracle(),
-        predictor=predictor,
         price_history_provider=hist,
-        realized_price_provider=realized,
-        auto_confirm=False,        # turn HITL on
+        auto_confirm=False,
     )
     graph = builder.compile(checkpointer=checkpointer)
-    now = datetime(2026, 2, 10, 0, 0, tzinfo=timezone.utc)
-    state = {
-        "now": now, "mains_chunk": None, "chunk_start": None,
-        "recent_onsets": [], "realized_prices": [], "event_log": [],
-        "cumulative_cost": 0.0, "cumulative_baseline_cost": 0.0, "iteration": 0,
-    }
+    now = datetime(2024, 11, 20, 2, 0, tzinfo=timezone.utc)
+    state = _base_state(now)
     cfg = {"configurable": {"thread_id": make_thread_id(now)}}
     first = graph.invoke(state, config=cfg)
-    assert "__interrupt__" in first, "expected an interrupt with a HITL question"
-
+    assert "__interrupt__" in first, "first plan should interrupt for user confirmation"
     second = graph.invoke(Command(resume="yes"), config=cfg)
     assert second.get("user_confirmation") == "yes"
-    assert second.get("iteration") == 1
+    assert second.get("current_plan") is not None
 
 
-def test_replan_reason_on_price_deviation(fake_onsets, fake_prices):
-    """Monitor should flag a replan when realized differs from forecast."""
-    # Inject a huge spike at a known slot.
-    spike_time = datetime(2026, 2, 10, 3, 0, tzinfo=timezone.utc)
-    fake_prices = fake_prices.copy()
-    fake_prices.loc[fake_prices["timestamp"] == spike_time, "lbmp"] = 500.0
-    hist, realized = _providers(fake_prices)
-
-    predictor = HybridBehavioralPredictor().fit(fake_onsets)
+def test_auto_confirms_when_small_delta(fake_prices):
+    hist = _providers(fake_prices)
     builder, checkpointer = build_graph(
-        watcher=SignalWatcher(signatures={}),
         price_oracle=SeasonalNaiveOracle(),
-        predictor=predictor,
         price_history_provider=hist,
-        realized_price_provider=realized,
-        auto_confirm=True,
+        auto_confirm=False,
     )
     graph = builder.compile(checkpointer=checkpointer)
-    state = {
-        "now": spike_time, "mains_chunk": None, "chunk_start": None,
-        "recent_onsets": [], "realized_prices": [], "event_log": [],
-        "cumulative_cost": 0.0, "cumulative_baseline_cost": 0.0, "iteration": 0,
-    }
-    cfg = {"configurable": {"thread_id": make_thread_id(spike_time)}}
-    r = graph.invoke(state, config=cfg)
-    assert r.get("replan_reason") and "price_deviation" in r["replan_reason"]
+    now = datetime(2024, 11, 20, 2, 0, tzinfo=timezone.utc)
+    state = _base_state(now)
+    cfg = {"configurable": {"thread_id": make_thread_id(now)}}
+    first = graph.invoke(state, config=cfg)
+    graph.invoke(Command(resume="yes"), config=cfg)
+
+    # Second invocation a few seconds later with the previous plan as baseline;
+    # receding-horizon MPC will produce an essentially identical plan.
+    state2 = _base_state(now + timedelta(seconds=5))
+    state2["previous_plan"] = first.get("current_plan")
+    cfg2 = {"configurable": {"thread_id": make_thread_id(now + timedelta(seconds=5))}}
+    second = graph.invoke(state2, config=cfg2)
+    # Either the policy auto-accepted or there was no interrupt at all.
+    assert "__interrupt__" not in second or (
+        second.get("user_confirmation", "").startswith("auto")
+    )

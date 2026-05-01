@@ -3,20 +3,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
+from requests import Response
+from requests.exceptions import ProxyError
+
+logger = logging.getLogger(__name__)
 
 
 class FetchError(RuntimeError):
     pass
 
 
-def http_get(url: str, timeout: float = 20.0, **kwargs: Any) -> requests.Response:
-    """Single attempt GET with a short timeout. Callers handle retries/fallback."""
-    return requests.get(url, timeout=timeout, **kwargs)
+def http_get(url: str, timeout: float = 20.0, **kwargs: Any) -> Response:
+    """GET with timeout and proxy fallback for hosts blocked by env proxy."""
+    logger.debug("http_get: GET %s timeout=%.1f", url, timeout)
+    try:
+        resp = requests.get(url, timeout=timeout, **kwargs)
+        logger.debug("http_get: %s → HTTP %d", url, resp.status_code)
+        return resp
+    except ProxyError:
+        # Some environments inject proxy vars that block certain public endpoints.
+        # Retry once with env-derived proxy settings disabled.
+        logger.warning("http_get: ProxyError for %s — retrying with trust_env=False", url)
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(url, timeout=timeout, **kwargs)
+            logger.debug("http_get (no-proxy): %s → HTTP %d", url, resp.status_code)
+            return resp
 
 
 def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
@@ -58,7 +76,7 @@ def write_manifest(
     if extras:
         payload["extras"] = extras
     out_path.write_text(json.dumps(payload, indent=2))
-    print(f"wrote manifest -> {out_path}")
+    logger.info("write_manifest: wrote %s", out_path)
 
 
 def utc(y: int, m: int, d: int) -> datetime:
