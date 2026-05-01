@@ -390,6 +390,27 @@ def test_pending_cycle_cost_is_in_expected_cost():
     assert abs(delta - expected_cycle_cost) < 1e-3
 
 
+def test_pending_cycle_cost_is_in_baseline_cost():
+    """``baseline_cost`` must include the pending cycle's energy so savings are not artificially negative."""
+    now = datetime(2026, 4, 15, 19, 45, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 60.0)
+    sched_with = solve_receding_horizon(
+        now, prices, horizon_slots=H_DAY, remaining_ev_kwh=0.0,
+        pending_cycles=[_pc("dishwasher", latest_start=8)],
+    )
+    sched_without = solve_receding_horizon(
+        now, prices, horizon_slots=H_DAY, remaining_ev_kwh=0.0,
+    )
+    cycle_slots = APPLIANCES["dishwasher"].cycle_slots
+    rated = APPLIANCES["dishwasher"].rated_kw
+    expected_cycle_cost = cycle_slots * rated * 0.25 * 60.0 / 1000.0
+    delta = sched_with.baseline_cost - sched_without.baseline_cost
+    assert abs(delta - expected_cycle_cost) < 1e-3, (
+        f"baseline_cost delta {delta:.4f} should equal cycle cost {expected_cycle_cost:.4f}; "
+        "savings will be wrong without it"
+    )
+
+
 def test_pending_cycle_filtered_when_already_committed():
     """If the same appliance is already in committed_tasks, the pending entry is skipped."""
     now = datetime(2026, 4, 15, 19, 45, tzinfo=timezone.utc)

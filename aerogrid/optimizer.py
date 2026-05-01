@@ -746,7 +746,7 @@ def solve_receding_horizon(
     sched.baseline_cost = _baseline_cost(
         prices, remaining_ev_kwh, remaining_heater_kwh_by_window,
         ev_mask, heater_masks, ev_spec.rated_kw, heater_spec.rated_kw,
-        committed_list, appliances, horizon_slots,
+        committed_list, appliances, horizon_slots, pending_list,
     )
     logger.info(
         "solve_receding_horizon: expected_cost=%.4f baseline_cost=%.4f "
@@ -817,6 +817,7 @@ def _baseline_cost(
     committed_tasks: list[ScheduledTask],
     appliances: dict,
     horizon_slots: int,
+    pending_cycles: Iterable[PendingCycle] | None = None,
 ) -> float:
     """Compute a price-unaware reference cost for the same horizon.
 
@@ -831,6 +832,10 @@ def _baseline_cost(
     * **Committed cycle tasks** (dishwasher / washing machine that are
       already running) contribute their rated power × duration × price as a
       constant — same on both sides so they never change the savings ratio.
+    * **Pending cycles** are costed at ``earliest_start_slot`` (immediate
+      onset), matching the unoptimised fallback and aligning with the
+      pending-cycle energy already carried by ``expected_cost`` via
+      ``prob.value``.
 
     The optimiser's ``expected_cost`` is then compared to this baseline to
     produce the "savings" ratio reported in the schedule and used as the
@@ -845,6 +850,10 @@ def _baseline_cost(
         rated = float(appliances[task.appliance].rated_kw)
         for t in range(task.start_slot, min(task.start_slot + task.slots, horizon_slots)):
             cost += rated * float(prices[t]) * _PER_SLOT_FACTOR
+    for pc in pending_cycles or []:
+        start = int(pc.earliest_start_slot)
+        for t in range(start, min(start + pc.cycle_slots, horizon_slots)):
+            cost += float(pc.rated_kw) * float(prices[t]) * _PER_SLOT_FACTOR
     return cost
 
 
