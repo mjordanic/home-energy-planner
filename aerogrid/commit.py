@@ -72,13 +72,6 @@ class CommitTracker:
         if not self._heater_deadlines:
             return None
         sorted_hours = sorted(d.hour for d in self._heater_deadlines)
-        # The active window is the one ending at the *next* deadline.
-        for h in sorted_hours:
-            target = now.replace(hour=h, minute=0, second=0, microsecond=0)
-            if target <= now:
-                target = target + timedelta(days=1)
-            # Walk forward in time picking the smallest target > now.
-            # Track the minimum.
         # Pick deadline with smallest distance ahead.
         best_hour = None
         best_dist = None
