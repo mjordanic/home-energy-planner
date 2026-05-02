@@ -11,7 +11,7 @@ AeroGrid is a 1 Hz streaming agent that shifts deferrable household loads — EV
 
 ![LangGraph node structure](docs/langgraph_structure.png)
 
-The **digital twin** is a thin orchestrator. It streams real DE-LU prices and a manually-listed sequence of appliance onsets into **N independent strategy agents** that run in parallel against the same inputs.
+The **digital twin** owns only the simulation environment — the price feed, the clock, and the onset stream. It passes the same inputs to **N independent strategies** running in parallel, and collects their outputs. All scheduling logic lives inside the strategies themselves, which makes it straightforward to compare them fairly.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -33,7 +33,7 @@ The **digital twin** is a thin orchestrator. It streams real DE-LU prices and a 
   BaselineStrategy          OptimizerStrategy
   ─────────────────         ──────────────────
   ASAP, no oracle           own price oracle
-  no graph                  own LangGraph
+  no graph                  own optimization and replanning
   no CommitTracker          own CommitTracker
                             own TriggerManager
 ```
@@ -116,7 +116,7 @@ uv run python -m aerogrid.sim.digital_twin
 uv run python -m aerogrid.sim.digital_twin --hours 24
 uv run python -m aerogrid.sim.digital_twin --hours 8 --horizon-hours 6 --no-log-file
 
-# Optional: Chronos / GridFM price oracle (requires torch)
+# Optional: Chronos price oracle (requires torch)
 uv sync --extra forecast
 uv run python -m aerogrid.sim.digital_twin --hours 24 --price-impl chronos
 ```
@@ -133,7 +133,7 @@ Outputs land in `data/cache/`:
 
 ## Key Design Choices
 
-- **Per-strategy isolation.** Each strategy owns its oracle, LangGraph, CommitTracker, and TriggerManager. The digital twin shares nothing except the onset stream and the realized price. Two `OptimizerStrategy` instances can run with different oracles in the same simulation.
+- **Per-strategy isolation.** Each `OptimizerStrategy` instance owns its own oracle, LangGraph, CommitTracker, and TriggerManager. `BaselineStrategy` is parameter-free and owns none of these. Two `OptimizerStrategy` instances can run in the same simulation with different oracles, evaluated against the same realized prices.
 - **Cross-strategy onset gating.** An onset is suppressed if *any* strategy still has the same appliance running, preventing a phantom second cycle in the comparison when strategies disagree on timing.
 - **Event-driven triggers.** Replans fire on state changes, not on a fixed clock — with a 30 s cooldown. The periodic 15-min resync is a safety net, not the primary trigger.
 - **Soft slacks.** EV and heater energy constraints are soft (penalty = 1000 × slack). The LP never goes infeasible; missed energy shows up as a non-zero slack in the solution.
@@ -154,7 +154,7 @@ aerogrid/
                        forecast_price → optimize → propose_reschedule
                                       → hitl_gate → commit_plan
   optimizer.py       receding-horizon LP/MIP (HiGHS via CVXPY)
-  price_oracle.py    GridFM / Chronos / SeasonalNaive
+  price_oracle.py    SeasonalNaive (default) / Chronos (optional)
   triggers.py        TriggerManager (new_onset / price_surprise /
                      deadline_slip / periodic + cooldown)
   commit.py          CommitTracker — remaining EV/heater kWh,
@@ -169,7 +169,7 @@ aerogrid/
 
 scripts/             one-shot data jobs
   fetch_smard_prices.py    SMARD DE-LU, no key, hard-fails on error
-  fetch_entsoe_prices.py   ENTSO-E alt (requires ENTSOE_API_KEY)
+  fetch_entsoe_prices.py   ENTSO-E alt fetcher (requires ENTSOE_API_KEY, data not included)
   _gen_readme_images.py    regenerate docs/ images
 
 notebooks/           EDA + demos (03 price oracle, 05 optimizer, 06 e2e)
@@ -183,10 +183,9 @@ docs/                static images for this README
 
 | source | window | path |
 |---|---|---|
-| SMARD DE-LU day-ahead 15 min (primary) | Jan 12 – Apr 18 2026 | `data/smard/de_lu_15min.parquet` |
-| ENTSO-E DE-LU (optional, requires key) | Dec 2024 | `data/entsoe/de_lu_15min.parquet` |
+| SMARD DE-LU day-ahead 15 min | Jan 12 – Apr 18 2026 | `data/smard/de_lu_15min.parquet` |
 
-The SMARD fetcher raises `FetchError` on any network or HTTP failure — there is no synthetic price fallback.
+The SMARD fetcher (`scripts/fetch_smard_prices.py`) downloads from the Bundesnetzagentur public API — no key required. It raises `FetchError` on any network or HTTP failure; there is no synthetic price fallback.
 
 ---
 
@@ -212,20 +211,13 @@ This is a demo. The following are real gaps worth addressing before any producti
 - Onsets are manually listed in `config.APPLIANCE_ONSETS`. In a real deployment you need NILM or smart plugs to detect when an appliance starts.
 
 **Price forecasting**
-- The default oracle (`naive`) is a seasonal baseline with no predictive power beyond yesterday's profile. Chronos and GridFM are optional but not tuned for DE-LU 15-min prices.
+- The default oracle (`naive`) is a seasonal baseline with no predictive power beyond yesterday's profile. Chronos is an optional alternative (`uv sync --extra forecast`), but has not been tuned for DE-LU 15-min prices.
 - The optimizer uses point forecasts — no uncertainty quantification, no scenario trees, no robust or stochastic MPC.
-
-**Savings metric**
-- `Schedule.savings()` compares forecast-optimised vs forecast-naive costs. It is *not* a realized counterfactual saving — you cannot observe what the naive strategy would have cost on the same realized prices in the same run.
-- The "naive baseline" (`_baseline_cost`) is price-unaware but still deadline-aware. A truly naive household would sometimes miss the EV deadline entirely, which would make the savings look larger than they are.
 
 **Simulation fidelity**
 - The simulation ticks at 1 Hz but processes 15-min price slots. There is no intra-slot price variation.
-- Both strategies see the same price oracle, so the optimizer does not have an information advantage from better forecasting — it only benefits from smarter load placement.
 - No battery storage, no solar PV, no grid export.
 
 **Engineering gaps**
 - The `OptimizerStrategy` re-solves the full LP/MIP on every trigger. With a longer horizon or many pending cycles this becomes slow (a 48 h run takes ~6 min wall time on a laptop).
-- No backtesting harness — comparing different oracle configurations requires running the full simulation each time.
-- Test coverage stops at the optimizer and core types; `strategies.py` and `digital_twin.py` have no unit tests.
 - The HITL `interrupt()` path works in simulation with `auto_confirm=True` but has not been tested with a real human-in-the-loop UI.

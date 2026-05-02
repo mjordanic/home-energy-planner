@@ -219,7 +219,7 @@ def gen_graph_diagram() -> Path:
     trig_cfg = [
         ("new onset",      "#0d47a1"),
         ("price spike\n≥25%", "#4a148c"),
-        ("deadline\nslip",  "#880e4f"),
+        ("EV deadline\nslip",  "#880e4f"),
         ("15-min\nresync",  "#1b5e20"),
     ]
     for tx, (lbl, col) in zip(TRIG_XS, trig_cfg):
