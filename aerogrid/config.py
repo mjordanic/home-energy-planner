@@ -427,6 +427,41 @@ def get_base_load_kw(now: datetime, n_slots: int) -> list[float]:
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Home Battery spec (ADR 0001, ADR 0002)                                      #
+# --------------------------------------------------------------------------- #
+# Physical constants for the stationary household battery.  Named with the
+# HOME_BATTERY_ prefix throughout to avoid any confusion with the EV battery.
+# Capacity: 13.5 kWh (Powerwall-class).  Max charge and discharge: 5 kW each.
+# Round-trip efficiency: η_c × η_d = 0.95 × 0.95 ≈ 90%.  No degradation cost.
+HOME_BATTERY_CAPACITY_KWH: float = 13.5
+HOME_BATTERY_MAX_POWER_KW: float = 5.0
+HOME_BATTERY_ETA_CHARGE: float = 0.95       # charge efficiency  (η_c)
+HOME_BATTERY_ETA_DISCHARGE: float = 0.95    # discharge efficiency (η_d)
+
+
+@dataclass(frozen=True)
+class BatterySpec:
+    """Physical spec for a stationary household battery.
+
+    Passed as an optional argument to :func:`aerogrid.optimizer.solve_receding_horizon`.
+    When ``None`` the battery is disabled and existing behaviour is unchanged.
+
+    Attributes:
+        capacity_kwh: Usable energy capacity (kWh). SoC is clamped to
+            ``[0, capacity_kwh]``.
+        max_charge_kw: Maximum charge power (kW). ``p_chg[t] ≤ max_charge_kw``.
+        max_discharge_kw: Maximum discharge power (kW). ``p_dis[t] ≤ max_discharge_kw``.
+        eta_charge: Charge efficiency ∈ (0, 1]. Energy stored = η_c × p_chg × Δt.
+        eta_discharge: Discharge efficiency ∈ (0, 1]. Energy released = p_dis × Δt / η_d.
+    """
+    capacity_kwh: float = HOME_BATTERY_CAPACITY_KWH
+    max_charge_kw: float = HOME_BATTERY_MAX_POWER_KW
+    max_discharge_kw: float = HOME_BATTERY_MAX_POWER_KW
+    eta_charge: float = HOME_BATTERY_ETA_CHARGE
+    eta_discharge: float = HOME_BATTERY_ETA_DISCHARGE
+
+
 def days_between(start: datetime, end: datetime) -> int:
     """Return the number of whole days between two UTC datetimes."""
     result = (end - start).days

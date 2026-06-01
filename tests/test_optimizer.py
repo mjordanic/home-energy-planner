@@ -491,3 +491,272 @@ def test_base_load_kw_does_not_appear_in_ev_heater_plan():
     ev_with = sum(sched_with.ev_power_kw) * 0.25
     ev_without = sum(sched_without.ev_power_kw) * 0.25
     assert ev_with == pytest.approx(ev_without, abs=1e-3)
+
+
+# --------------------------------------------------------------------------- #
+# Home Battery: pure-LP buffering                                              #
+# --------------------------------------------------------------------------- #
+
+def _batt() -> "BatterySpec":
+    """Default BatterySpec for tests."""
+    from aerogrid.config import BatterySpec
+    return BatterySpec()
+
+
+def test_battery_off_is_regression_clean():
+    """Without battery_spec the output is identical to today's call (no regression)."""
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _cheap_overnight()
+    sched_legacy = solve_receding_horizon(now, prices, remaining_ev_kwh=10.0)
+    sched_explicit = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=10.0,
+        battery_spec=None,    # explicitly off
+    )
+    assert sched_legacy.ev_power_kw == pytest.approx(sched_explicit.ev_power_kw, abs=1e-6)
+    assert sched_legacy.heater_power_kw == pytest.approx(sched_explicit.heater_power_kw, abs=1e-6)
+    assert sched_legacy.expected_cost == pytest.approx(sched_explicit.expected_cost, abs=1e-6)
+    # Battery vectors should be empty when battery is off.
+    assert sched_legacy.battery_charge_kw == []
+    assert sched_legacy.battery_discharge_kw == []
+    assert sched_legacy.soc_kwh == []
+
+
+def test_battery_charges_cheap_discharges_expensive():
+    """On cheap-overnight / expensive-day curve, battery charges at night and discharges during day.
+
+    The battery needs a base load to discharge into — without it there is no
+    grid draw to offset and no savings in the objective.
+    """
+    from aerogrid.config import get_base_load_kw
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 150.0)
+    prices[0:20] = 20.0   # cheap for first 5 hours (20:00-01:00)
+    base = np.asarray(get_base_load_kw(now, H_DAY))
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=_batt(), initial_soc_kwh=0.0,
+        base_load_kw=base,
+    )
+    chg = np.asarray(sched.battery_charge_kw)
+    dis = np.asarray(sched.battery_discharge_kw)
+    # Battery should charge during cheap slots (0..19)
+    assert chg[0:20].sum() > 0.0, "Battery should charge during cheap slots"
+    # Battery should discharge during expensive slots (20..95)
+    assert dis[20:].sum() > 0.0, "Battery should discharge during expensive slots"
+
+
+def test_battery_soc_follows_recursion():
+    """SoC follows soc[t+1] = soc[t] + η_c·p_chg·Δt − p_dis·Δt/η_d exactly."""
+    from aerogrid.config import BatterySpec
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 150.0)
+    prices[0:20] = 20.0
+    batt = BatterySpec()
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=batt, initial_soc_kwh=0.0,
+    )
+    chg = np.asarray(sched.battery_charge_kw)
+    dis = np.asarray(sched.battery_discharge_kw)
+    soc_arr = np.asarray(sched.soc_kwh)
+    # Verify SoC dynamics slot by slot (tolerance for solver precision).
+    for t in range(H_DAY - 1):
+        expected_next = (
+            soc_arr[t]
+            + batt.eta_charge * chg[t] * 0.25
+            - dis[t] * 0.25 / batt.eta_discharge
+        )
+        assert soc_arr[t + 1] == pytest.approx(expected_next, abs=1e-4), (
+            f"SoC recursion violated at slot {t}: "
+            f"soc[{t+1}]={soc_arr[t+1]:.4f} expected={expected_next:.4f}"
+        )
+
+
+def test_battery_soc_never_violates_bounds():
+    """SoC stays in [0, capacity_kwh]; p_chg and p_dis stay ≤ max_power."""
+    from aerogrid.config import BatterySpec
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 150.0)
+    prices[0:20] = 20.0
+    batt = BatterySpec()
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=batt, initial_soc_kwh=0.0,
+    )
+    chg = np.asarray(sched.battery_charge_kw)
+    dis = np.asarray(sched.battery_discharge_kw)
+    soc_arr = np.asarray(sched.soc_kwh)
+    assert (soc_arr >= -1e-4).all(), f"SoC below 0: min={soc_arr.min():.4f}"
+    assert (soc_arr <= batt.capacity_kwh + 1e-4).all(), (
+        f"SoC above capacity: max={soc_arr.max():.4f}"
+    )
+    assert (chg >= -1e-4).all(), "p_chg below 0"
+    assert (chg <= batt.max_charge_kw + 1e-4).all(), f"p_chg exceeds P_max: {chg.max():.4f}"
+    assert (dis >= -1e-4).all(), "p_dis below 0"
+    assert (dis <= batt.max_discharge_kw + 1e-4).all(), f"p_dis exceeds P_max: {dis.max():.4f}"
+
+
+def test_battery_no_cycle_below_loss_threshold():
+    """With a price spread below the round-trip loss threshold, battery stays idle."""
+    from aerogrid.config import BatterySpec
+    # Round-trip efficiency ≈ 0.95 × 0.95 = 0.9025.
+    # For cycling to be profitable: price_high / price_low > 1 / (η_c × η_d).
+    # Threshold ≈ 1 / 0.9025 ≈ 1.108. Use a spread of 1.05 (below threshold).
+    batt = BatterySpec()
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 100.0)
+    prices[0:20] = 100.0    # all flat at 100 — no spread at all
+    prices[20:] = 105.0     # tiny 5% spread — below ~10.8% threshold
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=batt, initial_soc_kwh=0.0,
+    )
+    chg = np.asarray(sched.battery_charge_kw)
+    dis = np.asarray(sched.battery_discharge_kw)
+    # Battery should not cycle (net charge + net discharge must be very small).
+    total_throughput = chg.sum() + dis.sum()
+    assert total_throughput == pytest.approx(0.0, abs=1e-2), (
+        f"Battery cycled {total_throughput:.3f} kWh despite insufficient spread"
+    )
+
+
+def test_battery_cycles_above_loss_threshold():
+    """With a large enough price spread, the battery should cycle.
+
+    Requires base_load so discharge has a load to offset.
+    """
+    from aerogrid.config import get_base_load_kw
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    # Cheap slots: 20:00-02:00 (first 24 slots), expensive: rest.
+    # Spread: 20 vs 200 EUR/MWh → ratio 10x >> threshold ~1.108.
+    prices = np.full(H_DAY, 200.0)
+    prices[0:24] = 20.0
+    base = np.asarray(get_base_load_kw(now, H_DAY))
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=_batt(), initial_soc_kwh=0.0,
+        base_load_kw=base,
+    )
+    chg = np.asarray(sched.battery_charge_kw)
+    dis = np.asarray(sched.battery_discharge_kw)
+    assert chg.sum() > 0.1, "Battery should charge with 10x price spread"
+    assert dis.sum() > 0.1, "Battery should discharge with 10x price spread"
+
+
+def test_battery_terminal_reward_prevents_edge_dumping():
+    """Battery charges in cheap trough near horizon end: terminal reward makes it worthwhile.
+
+    Scenario: expensive slots 0..59, cheap trough at 60..79, expensive again 80..95.
+    The expensive tail (80..95) is the payoff window. Without terminal reward the
+    optimizer might not charge in 60..79 if the payoff within the horizon boundary
+    is uncertain. With the terminal reward, charging in 60..79 is always beneficial
+    because the leftover SoC is rewarded at λ = (min_price/1000) × η_d.
+
+    We verify: the battery charges in the cheap trough (sums to > 0).
+    """
+    from aerogrid.config import BatterySpec, get_base_load_kw
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 200.0)   # expensive baseline
+    prices[60:80] = 10.0             # cheap trough near horizon end
+    base = np.asarray(get_base_load_kw(now, H_DAY))
+    batt = BatterySpec()
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=batt, initial_soc_kwh=0.0,
+        base_load_kw=base,
+    )
+    chg = np.asarray(sched.battery_charge_kw)
+    soc_arr = np.asarray(sched.soc_kwh)
+    # Battery should charge in cheap trough and discharge in expensive slots after it.
+    cheap_charge = chg[60:80].sum()
+    assert cheap_charge > 0.0, (
+        "Battery should charge in cheap trough; terminal reward makes it worthwhile "
+        "even near the horizon edge"
+    )
+    assert (soc_arr >= -1e-4).all(), "SoC must not go negative"
+
+
+def test_battery_net_grid_no_export_and_under_cap():
+    """net_grid[t] = loads + charge − discharge is always in [0, cap]."""
+    from aerogrid.config import BatterySpec, get_base_load_kw
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 150.0)
+    prices[0:20] = 20.0
+    cap = 10.0  # HOUSE_POWER_CAP_KW
+    batt = BatterySpec()
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=5.0, remaining_heater_kwh_by_window={7: 2.0, 18: 0.0},
+        battery_spec=batt, initial_soc_kwh=0.0, house_cap_kw=cap,
+    )
+    ev = np.asarray(sched.ev_power_kw)
+    heat = np.asarray(sched.heater_power_kw)
+    chg = np.asarray(sched.battery_charge_kw)
+    dis = np.asarray(sched.battery_discharge_kw)
+    base = np.asarray(get_base_load_kw(now, H_DAY))
+    net_grid = ev + heat + chg - dis + base
+    assert (net_grid >= -1e-4).all(), f"Export detected: min net_grid={net_grid.min():.4f}"
+    assert (net_grid <= cap + 1e-4).all(), f"Cap violated: max net_grid={net_grid.max():.4f}"
+
+
+def test_battery_discharge_relaxes_cap():
+    """Battery discharge allows total household draw to exceed net grid cap.
+
+    With cap=3 kW and a 2 kW load + 2 kW heater = 4 kW, the battery must
+    discharge to keep net_grid ≤ 3 kW in those slots.
+    """
+    from aerogrid.config import BatterySpec
+    now = datetime(2026, 4, 15, 0, 0, tzinfo=timezone.utc)  # midnight: inside heater window
+    # All-cheap prices so heater wants to run everywhere.
+    prices = np.full(H_DAY, 50.0)
+    batt = BatterySpec(capacity_kwh=5.0, max_charge_kw=3.0, max_discharge_kw=3.0)
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0,
+        remaining_heater_kwh_by_window={7: 2.0, 18: 0.0},
+        base_load_kw=np.full(H_DAY, 2.0),  # constant 2 kW base
+        battery_spec=batt, initial_soc_kwh=5.0,  # start full
+        house_cap_kw=3.0,
+    )
+    # net_grid must respect the 3 kW cap.
+    from aerogrid.config import get_base_load_kw
+    ev = np.asarray(sched.ev_power_kw)
+    heat = np.asarray(sched.heater_power_kw)
+    chg = np.asarray(sched.battery_charge_kw)
+    dis = np.asarray(sched.battery_discharge_kw)
+    base = np.full(H_DAY, 2.0)
+    net_grid = ev + heat + chg - dis + base
+    assert (net_grid <= 3.0 + 1e-4).all(), (
+        f"Cap violated with battery discharge: max net_grid={net_grid.max():.4f}"
+    )
+
+
+def test_battery_schedule_vectors_populated():
+    """Schedule fields battery_charge_kw, battery_discharge_kw, soc_kwh are populated."""
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _cheap_overnight()
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=_batt(), initial_soc_kwh=0.0,
+    )
+    assert len(sched.battery_charge_kw) == H_DAY
+    assert len(sched.battery_discharge_kw) == H_DAY
+    assert len(sched.soc_kwh) == H_DAY
+    assert all(v >= 0.0 for v in sched.battery_charge_kw)
+    assert all(v >= 0.0 for v in sched.battery_discharge_kw)
+    assert all(v >= 0.0 for v in sched.soc_kwh)
+
+
+def test_battery_as_dict_includes_battery_fields():
+    """Schedule.as_dict() includes battery_charge_kw, battery_discharge_kw, soc_kwh."""
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _cheap_overnight()
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=_batt(), initial_soc_kwh=0.0,
+    )
+    d = sched.as_dict()
+    assert "battery_charge_kw" in d
+    assert "battery_discharge_kw" in d
+    assert "soc_kwh" in d
+    assert len(d["battery_charge_kw"]) == H_DAY
+    assert len(d["battery_discharge_kw"]) == H_DAY
+    assert len(d["soc_kwh"]) == H_DAY

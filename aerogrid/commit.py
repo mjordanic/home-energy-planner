@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 
 from aerogrid.config import (
     APPLIANCES,
+    BatterySpec,
     EV_DAILY_NEED_KWH,
     EV_DEADLINE_HOUR,
     HEATER_DEADLINES,
@@ -65,6 +66,15 @@ class CommitTracker:
     # Track which heater window the current ``now`` lives in, so the heater
     # setpoint is debited from the right window.
     _heater_deadlines: tuple[HeaterEnergyDeadline, ...] = HEATER_DEADLINES
+
+    # ---- Home Battery SoC tracking ---------------------------------------- #
+    # ``battery_spec`` must be set to enable SoC tracking.  When ``None``
+    # (the default) the tracker holds no battery state and ``tick()`` skips
+    # all battery accounting — backward-compatible.
+    battery_spec: BatterySpec | None = None
+    soc_kwh: float = 0.0
+    battery_charge_setpoint_kw: float = 0.0
+    battery_discharge_setpoint_kw: float = 0.0
 
     # ------------------------------------------------------------------ #
     def _active_heater_window(self, now: datetime) -> int | None:
@@ -114,6 +124,24 @@ class CommitTracker:
                     "CommitTracker.tick: heater window=%02d:00 delivered=%.4fkWh "
                     "remaining=%.3fkWh → %.3fkWh (setpoint=%.2fkW)",
                     active_h, delivered, prev, new_val, self.heater_power_setpoint_kw,
+                )
+
+        # Update Home Battery SoC from charge/discharge setpoints.
+        if self.battery_spec is not None:
+            bspec = self.battery_spec
+            if self.battery_charge_setpoint_kw > 0.0:
+                energy_stored = bspec.eta_charge * self.battery_charge_setpoint_kw * dt_s / 3600.0
+                self.soc_kwh = min(bspec.capacity_kwh, self.soc_kwh + energy_stored)
+                logger.debug(
+                    "CommitTracker.tick: battery charge stored=%.4f kWh soc=%.3f kWh",
+                    energy_stored, self.soc_kwh,
+                )
+            if self.battery_discharge_setpoint_kw > 0.0:
+                energy_released = self.battery_discharge_setpoint_kw * dt_s / 3600.0 / bspec.eta_discharge
+                self.soc_kwh = max(0.0, self.soc_kwh - energy_released)
+                logger.debug(
+                    "CommitTracker.tick: battery discharge released=%.4f kWh soc=%.3f kWh",
+                    energy_released, self.soc_kwh,
                 )
 
         # Reset the daily EV target exactly at the deadline hour.
@@ -188,6 +216,20 @@ class CommitTracker:
                 self.heater_power_setpoint_kw, new_setpoint,
             )
             self.heater_power_setpoint_kw = new_setpoint
+
+        # Battery setpoints — only if the plan contains battery vectors.
+        if plan.battery_charge_kw:
+            self.battery_charge_setpoint_kw = float(plan.battery_charge_kw[0])
+            logger.info(
+                "CommitTracker: battery charge setpoint → %.2f kW",
+                self.battery_charge_setpoint_kw,
+            )
+        if plan.battery_discharge_kw:
+            self.battery_discharge_setpoint_kw = float(plan.battery_discharge_kw[0])
+            logger.info(
+                "CommitTracker: battery discharge setpoint → %.2f kW",
+                self.battery_discharge_setpoint_kw,
+            )
 
         existing = {t.appliance for t in self.committed_tasks}
         for task in plan.tasks:
@@ -307,6 +349,9 @@ class CommitTracker:
             "heater_power_setpoint_kw": self.heater_power_setpoint_kw,
             "remaining_heater_kwh_by_window": dict(self.remaining_heater_kwh_by_window),
             "committed_tasks": [t.as_dict() for t in self.committed_tasks],
+            "soc_kwh": self.soc_kwh,
+            "battery_charge_setpoint_kw": self.battery_charge_setpoint_kw,
+            "battery_discharge_setpoint_kw": self.battery_discharge_setpoint_kw,
         }
 
 
