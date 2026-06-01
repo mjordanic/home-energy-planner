@@ -44,6 +44,7 @@ from aerogrid.config import (
     HITL_RESCHEDULE_WINDOW_HOURS,
     SHORT_HORIZON_SLOTS,
     SLOT_MINUTES,
+    get_base_load_kw,
 )
 from aerogrid.hitl_policy import decide as hitl_decide
 from aerogrid.hitl_policy import decide_reschedule as hitl_decide_reschedule
@@ -293,6 +294,8 @@ def build_graph(
             [pc.appliance for pc in pending_cycles],
         )
         hours = time_to_deadline_hours(now)
+        # Build the slot-aligned Base Load array for this horizon (ADR 0003).
+        base_load = np.asarray(get_base_load_kw(now, n_slots=horizon_slots), dtype=float)
         sched = solve_receding_horizon(
             now=now,
             prices=prices,
@@ -302,6 +305,7 @@ def build_graph(
             committed_tasks=committed,
             pending_cycles=pending_cycles,
             horizon_slots=horizon_slots,
+            base_load_kw=base_load,
         )
         logger.info(
             "graph.n_optimize: plan solver=%s expected_cost=%.4f tasks=%s cycle_starts=%s",

@@ -393,6 +393,7 @@ def solve_receding_horizon(
     heater_deadlines: tuple[HeaterEnergyDeadline, ...] | None = None,
     ev_available_from_hour: int = EV_AVAILABLE_FROM_HOUR,
     ev_deadline_hour: int = EV_DEADLINE_HOUR,
+    base_load_kw: np.ndarray | None = None,
 ) -> Schedule:
     """Solve the receding-horizon LP for the next ``horizon_slots`` slots.
 
@@ -441,6 +442,13 @@ def solve_receding_horizon(
         heater_deadlines: Override of :data:`aerogrid.config.HEATER_DEADLINES`.
         ev_available_from_hour, ev_deadline_hour: Override the EV charging
             window boundaries.
+        base_load_kw: Optional per-slot always-on inflexible demand array
+            of length ``horizon_slots`` (kW).  Defaults to zeros when
+            ``None``, which preserves existing optimizer behaviour exactly
+            (regression-clean no-op).  The base load is added to the
+            per-slot load against the house cap but is **exogenous** — it
+            does not appear in ``ev_power_kw`` or ``heater_power_kw`` and
+            does not count towards the EV/heater energy constraints.
 
     Returns:
         :class:`~aerogrid.types.Schedule` populated with ``ev_power_kw``,
@@ -488,6 +496,18 @@ def solve_receding_horizon(
     prices = _prep_prices(prices, horizon_slots)
     horizon_h = horizon_slots * _SLOT_HOURS
     slot0 = _floor_slot(now)
+
+    # Normalise base_load_kw to a length-horizon_slots float array.
+    # Defaults to zeros → regression-clean no-op when caller omits it.
+    if base_load_kw is None:
+        _base_load = np.zeros(horizon_slots, dtype=float)
+    else:
+        _base_load = np.asarray(base_load_kw, dtype=float).reshape(-1)
+        if _base_load.size < horizon_slots:
+            _base_load = np.concatenate(
+                [_base_load, np.zeros(horizon_slots - _base_load.size)]
+            )
+        _base_load = _base_load[:horizon_slots]
 
     if time_to_deadline_h is None:
         time_to_deadline_h = time_to_deadline_hours(now, ev_deadline_hour)
@@ -587,8 +607,9 @@ def solve_receding_horizon(
         )
 
     # --- 5. C5: house power cap at every slot ------------------------------- #
+    # base_load is exogenous (no decision variable) — add it as a constant.
     for t in range(horizon_slots):
-        load_t = p_ev[t] + p_heat[t]
+        load_t = p_ev[t] + p_heat[t] + float(_base_load[t])
         for task in committed_list:
             if task.start_slot <= t < task.start_slot + task.slots:
                 load_t = load_t + appliances[task.appliance].rated_kw

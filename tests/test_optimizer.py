@@ -430,3 +430,64 @@ def test_pending_cycle_filtered_when_already_committed():
     )
     # The pending entry was filtered → no cycle_starts entry emitted.
     assert "dishwasher" not in sched.cycle_starts
+
+
+# --------------------------------------------------------------------------- #
+# Base Load: optional base_load_kw parameter                                  #
+# --------------------------------------------------------------------------- #
+def test_base_load_kw_default_is_regression_clean():
+    """Without base_load_kw, output is byte-for-byte identical to the legacy call.
+
+    This is the regression guard that proves the optional-param design is a
+    true no-op when base_load_kw is omitted.
+    """
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _cheap_overnight()
+    sched_legacy = solve_receding_horizon(now, prices, remaining_ev_kwh=10.0)
+    sched_explicit = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=10.0,
+        base_load_kw=np.zeros(H_DAY),
+    )
+    # Both solves should produce identical power profiles.
+    assert sched_legacy.ev_power_kw == pytest.approx(sched_explicit.ev_power_kw, abs=1e-6)
+    assert sched_legacy.heater_power_kw == pytest.approx(sched_explicit.heater_power_kw, abs=1e-6)
+    assert sched_legacy.expected_cost == pytest.approx(sched_explicit.expected_cost, abs=1e-6)
+
+
+def test_base_load_kw_reduces_cap_headroom():
+    """base_load_kw added to each slot reduces headroom under the house cap.
+
+    With a 10 kW cap and 9 kW base load, only 1 kW is available for the
+    EV + heater at those slots.
+    """
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _flat_prices()
+    # 9 kW base load across all slots — tight cap.
+    base = np.full(H_DAY, 9.0)
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=1.0,
+        base_load_kw=base,
+        house_cap_kw=10.0,
+    )
+    ev = np.asarray(sched.ev_power_kw)
+    heat = np.asarray(sched.heater_power_kw)
+    # EV + heater must respect the 1 kW residual cap.
+    assert (ev + heat).max() <= 1.0 + 1e-4
+
+
+def test_base_load_kw_does_not_appear_in_ev_heater_plan():
+    """Base load is exogenous — it must not pollute the EV or heater arrays."""
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _flat_prices()
+    base = np.full(H_DAY, 0.3)
+    sched_with = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=5.0, base_load_kw=base,
+    )
+    sched_without = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=5.0,
+    )
+    # EV kWh delivered must be the same regardless of base_load_kw
+    # (base load does not count towards EV energy need).
+    ev_with = sum(sched_with.ev_power_kw) * 0.25
+    ev_without = sum(sched_without.ev_power_kw) * 0.25
+    assert ev_with == pytest.approx(ev_without, abs=1e-3)

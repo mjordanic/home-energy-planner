@@ -61,6 +61,7 @@ from aerogrid.config import (
     SHORT_HORIZON_SLOTS,
     SLOT_MINUTES,
     HeaterEnergyDeadline,
+    get_base_load_kw,
 )
 from aerogrid.graph import build_graph, make_thread_id as _default_make_thread_id
 from aerogrid.price_oracle import make_oracle
@@ -82,11 +83,17 @@ class SlotRecord:
     strategy's SlotRecord (column-prefixed by ``strategy.name`` via
     :meth:`to_flat_dict`).  ``extra`` holds strategy-specific fields that
     don't fit the common schema.
+
+    ``base_load_kw`` is the always-on inflexible household demand (fridge +
+    lights + standby + cooking) for this slot, derived from
+    :func:`aerogrid.config.get_base_load_kw`.  It is added to both
+    ``total_kw`` and accrued cost for every strategy (ADR 0003).
     """
     timestamp: datetime
     ev_kw: float
     heater_kw: float
     cycle_kw: float
+    base_load_kw: float
     total_kw: float
     slot_cost_eur: float
     cum_cost_eur: float
@@ -100,6 +107,7 @@ class SlotRecord:
             f"{prefix}_ev_kw": self.ev_kw,
             f"{prefix}_heater_kw": self.heater_kw,
             f"{prefix}_cycle_kw": self.cycle_kw,
+            f"{prefix}_base_load_kw": self.base_load_kw,
             f"{prefix}_total_kw": self.total_kw,
             f"{prefix}_slot_cost_eur": self.slot_cost_eur,
             f"{prefix}_cum_cost_eur": self.cum_cost_eur,
@@ -482,7 +490,9 @@ class BaselineStrategy(Strategy):
     # ------------------------------------------------------------------ #
     def get_slot_record(self, now: datetime, price_eur_mwh: float) -> SlotRecord:
         cycle_kw = sum(pwr for _, _, pwr in self._active_cycles)
-        total_kw = self._ev_power_kw + self._heater_power_kw + cycle_kw
+        # Base Load: always-on inflexible demand (ADR 0003).
+        base_kw = get_base_load_kw(now, n_slots=1)[0]
+        total_kw = self._ev_power_kw + self._heater_power_kw + cycle_kw + base_kw
         slot_cost = total_kw * (SLOT_MINUTES / 60.0) * (price_eur_mwh / 1000.0)
         self.cumulative_cost += slot_cost
 
@@ -491,6 +501,7 @@ class BaselineStrategy(Strategy):
             ev_kw=self._ev_power_kw,
             heater_kw=self._heater_power_kw,
             cycle_kw=cycle_kw,
+            base_load_kw=base_kw,
             total_kw=total_kw,
             slot_cost_eur=slot_cost,
             cum_cost_eur=self.cumulative_cost,
@@ -862,7 +873,9 @@ class OptimizerStrategy(Strategy):
         cycle_kw = sum(APPLIANCES[t.appliance].rated_kw for t in running_tasks)
         ev_kw = self.commit.ev_power_setpoint_kw
         heater_kw = self.commit.heater_power_setpoint_kw
-        total_kw = ev_kw + heater_kw + cycle_kw
+        # Base Load: always-on inflexible demand (ADR 0003).
+        base_kw = get_base_load_kw(now, n_slots=1)[0]
+        total_kw = ev_kw + heater_kw + cycle_kw + base_kw
         slot_cost = total_kw * (SLOT_MINUTES / 60.0) * (price_eur_mwh / 1000.0)
         self.cumulative_cost += slot_cost
 
@@ -871,6 +884,7 @@ class OptimizerStrategy(Strategy):
             ev_kw=ev_kw,
             heater_kw=heater_kw,
             cycle_kw=cycle_kw,
+            base_load_kw=base_kw,
             total_kw=total_kw,
             slot_cost_eur=slot_cost,
             cum_cost_eur=self.cumulative_cost,
