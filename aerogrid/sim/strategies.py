@@ -53,11 +53,16 @@ from typing import Any, Callable
 from aerogrid.commit import CommitTracker
 from aerogrid.config import (
     APPLIANCES,
+    BatterySpec,
     EV_AVAILABLE_FROM_HOUR,
     EV_DAILY_NEED_KWH,
     EV_DEADLINE_HOUR,
     HEATER_DEADLINES,
     HITL_AUTO_RESPONSES,
+    HOME_BATTERY_CAPACITY_KWH,
+    HOME_BATTERY_ETA_CHARGE,
+    HOME_BATTERY_ETA_DISCHARGE,
+    HOME_BATTERY_MAX_POWER_KW,
     SHORT_HORIZON_SLOTS,
     SLOT_MINUTES,
     HeaterEnergyDeadline,
@@ -88,6 +93,12 @@ class SlotRecord:
     lights + standby + cooking) for this slot, derived from
     :func:`aerogrid.config.get_base_load_kw`.  It is added to both
     ``total_kw`` and accrued cost for every strategy (ADR 0003).
+
+    ``battery_charge_kw``, ``battery_discharge_kw``, ``soc_kwh``, and
+    ``net_grid_kw`` are populated by battery-enabled strategies.  For
+    non-battery strategies these default to 0.0 and ``net_grid_kw`` equals
+    ``total_kw`` (no battery offset).  Cost for battery-enabled strategies
+    accrues on ``net_grid_kw``, not ``total_kw`` (ADR 0001).
     """
     timestamp: datetime
     ev_kw: float
@@ -100,6 +111,11 @@ class SlotRecord:
     remaining_ev_kwh: float
     active_cycles: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    # Home Battery fields — 0.0 for non-battery strategies.
+    battery_charge_kw: float = 0.0
+    battery_discharge_kw: float = 0.0
+    soc_kwh: float = 0.0
+    net_grid_kw: float = 0.0   # gross_load + p_chg − p_dis; equals total_kw when no battery
 
     def to_flat_dict(self, prefix: str) -> dict[str, Any]:
         """Flatten into a dict whose keys are ``{prefix}_<field>``."""
@@ -113,6 +129,10 @@ class SlotRecord:
             f"{prefix}_cum_cost_eur": self.cum_cost_eur,
             f"{prefix}_remaining_ev_kwh": self.remaining_ev_kwh,
             f"{prefix}_active_cycles": ",".join(self.active_cycles),
+            f"{prefix}_battery_charge_kw": self.battery_charge_kw,
+            f"{prefix}_battery_discharge_kw": self.battery_discharge_kw,
+            f"{prefix}_soc_kwh": self.soc_kwh,
+            f"{prefix}_net_grid_kw": self.net_grid_kw,
         }
         for k, v in self.extra.items():
             out[f"{prefix}_{k}"] = v
@@ -507,6 +527,8 @@ class BaselineStrategy(Strategy):
             cum_cost_eur=self.cumulative_cost,
             remaining_ev_kwh=self.remaining_ev_kwh,
             active_cycles=[a for a, _, _ in self._active_cycles],
+            # No battery — net_grid_kw equals gross load.
+            net_grid_kw=total_kw,
         )
 
 
@@ -544,9 +566,27 @@ class OptimizerStrategy(Strategy):
         auto_confirm: bool = True,
         auto_responses: dict[str, str] | None = None,
         replan_jsonl_path: Path | None = None,
+        battery_enabled: bool = False,
     ) -> None:
         super().__init__(name)
-        self.commit = CommitTracker(remaining_ev_kwh=EV_DAILY_NEED_KWH)
+        # Battery spec — only wired when battery_enabled is True.
+        self._battery_enabled = battery_enabled
+        self._battery_spec: BatterySpec | None = (
+            BatterySpec(
+                capacity_kwh=HOME_BATTERY_CAPACITY_KWH,
+                max_charge_kw=HOME_BATTERY_MAX_POWER_KW,
+                max_discharge_kw=HOME_BATTERY_MAX_POWER_KW,
+                eta_charge=HOME_BATTERY_ETA_CHARGE,
+                eta_discharge=HOME_BATTERY_ETA_DISCHARGE,
+            )
+            if battery_enabled
+            else None
+        )
+        self.commit = CommitTracker(
+            remaining_ev_kwh=EV_DAILY_NEED_KWH,
+            battery_spec=self._battery_spec,
+            soc_kwh=0.0,
+        )
         self.trig = TriggerManager()
         self.auto_responses = (
             auto_responses if auto_responses is not None
@@ -697,6 +737,9 @@ class OptimizerStrategy(Strategy):
             "replan_trigger": trigger,
             "event_log": [],
             "cumulative_cost": self.cumulative_cost,
+            # Battery state — passed through when battery_enabled is True.
+            "battery_spec": self._battery_spec,
+            "soc_kwh": self.commit.soc_kwh,
         }
         cfg = {"configurable": {"thread_id": self._make_thread_id(now)}}
         try:
@@ -876,7 +919,23 @@ class OptimizerStrategy(Strategy):
         # Base Load: always-on inflexible demand (ADR 0003).
         base_kw = get_base_load_kw(now, n_slots=1)[0]
         total_kw = ev_kw + heater_kw + cycle_kw + base_kw
-        slot_cost = total_kw * (SLOT_MINUTES / 60.0) * (price_eur_mwh / 1000.0)
+
+        # Battery fields — only populated when battery is enabled.
+        batt_chg_kw = 0.0
+        batt_dis_kw = 0.0
+        soc = 0.0
+        if self._battery_enabled:
+            batt_chg_kw = self.commit.battery_charge_setpoint_kw
+            batt_dis_kw = self.commit.battery_discharge_setpoint_kw
+            soc = self.commit.soc_kwh
+
+        # Net grid draw: gross loads + charge draw − discharge offset (ADR 0001).
+        net_grid_kw = total_kw + batt_chg_kw - batt_dis_kw
+
+        # Cost accrues on net grid draw for battery-enabled strategies,
+        # on gross load for non-battery strategies.
+        billing_kw = net_grid_kw if self._battery_enabled else total_kw
+        slot_cost = billing_kw * (SLOT_MINUTES / 60.0) * (price_eur_mwh / 1000.0)
         self.cumulative_cost += slot_cost
 
         rec = SlotRecord(
@@ -890,6 +949,10 @@ class OptimizerStrategy(Strategy):
             cum_cost_eur=self.cumulative_cost,
             remaining_ev_kwh=self.commit.remaining_ev_kwh,
             active_cycles=[t.appliance for t in running_tasks],
+            battery_charge_kw=batt_chg_kw,
+            battery_discharge_kw=batt_dis_kw,
+            soc_kwh=soc,
+            net_grid_kw=net_grid_kw,
             extra={
                 "trigger_kind": self._last_trigger_kind,
                 "solver_status": self._last_solver_status,

@@ -296,6 +296,10 @@ def build_graph(
         hours = time_to_deadline_hours(now)
         # Build the slot-aligned Base Load array for this horizon (ADR 0003).
         base_load = np.asarray(get_base_load_kw(now, n_slots=horizon_slots), dtype=float)
+        # Battery spec and initial SoC — passed through from OptimizerStrategy
+        # when battery_enabled=True; None otherwise (backward-compatible).
+        battery_spec = state.get("battery_spec")
+        initial_soc_kwh = float(state.get("soc_kwh") or 0.0)
         sched = solve_receding_horizon(
             now=now,
             prices=prices,
@@ -306,6 +310,8 @@ def build_graph(
             pending_cycles=pending_cycles,
             horizon_slots=horizon_slots,
             base_load_kw=base_load,
+            battery_spec=battery_spec,
+            initial_soc_kwh=initial_soc_kwh,
         )
         logger.info(
             "graph.n_optimize: plan solver=%s expected_cost=%.4f tasks=%s cycle_starts=%s",
