@@ -1,6 +1,6 @@
 # Bill-level Savings: net the discharge credit against a real Base-Load cost
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 

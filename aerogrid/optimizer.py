@@ -710,6 +710,15 @@ def solve_receding_horizon(
         for t in range(task.start_slot, min(task.start_slot + task.slots, horizon_slots)):
             committed_cost += rated * float(prices[t]) * _PER_SLOT_FACTOR
 
+    # Compute min_price and λ once; reused for both the terminal reward (objective)
+    # and the expected_cost back-out (section 8b). Avoids drift between the two.
+    min_price: float = float(prices.min()) if prices.size else 0.0
+    lambda_val: float = (
+        (min_price / 1000.0) * battery_spec.eta_discharge
+        if battery_spec is not None
+        else 0.0
+    )
+
     # Value-of-stored-energy terminal reward (ADR 0002): reward leftover SoC at
     # horizon end at its cheapest acquisition cost × η_d.  This prevents both
     # edge-dumping (battery drains before T) and myopic under-charging (battery
@@ -718,8 +727,6 @@ def solve_receding_horizon(
     # Adding -λ·soc[T] to a minimisation objective rewards storing energy.
     terminal_reward: cp.Expression | float = 0.0
     if battery_spec is not None:
-        min_price = float(prices.min()) if prices.size else 0.0
-        lambda_val = (min_price / 1000.0) * battery_spec.eta_discharge
         terminal_reward = -lambda_val * soc[horizon_slots]
 
     slack_term = _SLACK_PENALTY * (slack_ev + sum(slack_heat.values()))
@@ -861,21 +868,24 @@ def solve_receding_horizon(
         [f"{v:.2f}" for v in sched.heater_power_kw[: min(8, horizon_slots)]],
     )
 
-    # expected_cost = objective − slack_penalty_term − terminal_reward_term + committed_cost
+    # expected_cost = objective − slack_penalty_term − terminal_reward_term
+    #               + committed_cost + base_load_cost
     # The terminal reward is a negative term in the minimisation objective; we subtract it
     # back out so expected_cost reflects real net grid expenditure (not negative energy profit).
+    # Base-Load cost is added here and to baseline_cost so the savings ratio measures money
+    # off the *total* bill — the only thing a Home Battery exists to reduce (ADR 0003).
     terminal_reward_val = 0.0
     if battery_spec is not None and soc is not None:
-        min_price = float(prices.min()) if prices.size else 0.0
-        lambda_val = (min_price / 1000.0) * battery_spec.eta_discharge
         terminal_reward_val = -lambda_val * float(soc.value[horizon_slots])
+    base_load_cost = float((_base_load * prices).sum() * _PER_SLOT_FACTOR)
     sched.expected_cost = float(prob.value - _SLACK_PENALTY * (
         float(slack_ev.value or 0.0) + sum(float(s.value or 0.0) for s in slack_heat.values())
-    ) - terminal_reward_val + committed_cost)
+    ) - terminal_reward_val + committed_cost + base_load_cost)
     sched.baseline_cost = _baseline_cost(
         prices, remaining_ev_kwh, remaining_heater_kwh_by_window,
         ev_mask, heater_masks, ev_spec.rated_kw, heater_spec.rated_kw,
         committed_list, appliances, horizon_slots, pending_list,
+        base_load=_base_load,
     )
     logger.info(
         "solve_receding_horizon: expected_cost=%.4f baseline_cost=%.4f "
@@ -947,6 +957,7 @@ def _baseline_cost(
     appliances: dict,
     horizon_slots: int,
     pending_cycles: Iterable[PendingCycle] | None = None,
+    base_load: np.ndarray | None = None,
 ) -> float:
     """Compute a price-unaware reference cost for the same horizon.
 
@@ -965,6 +976,10 @@ def _baseline_cost(
       onset), matching the unoptimised fallback and aligning with the
       pending-cycle energy already carried by ``expected_cost`` via
       ``prob.value``.
+    * **Base Load** — always-on inflexible demand. Added to both
+      ``baseline_cost`` and ``expected_cost`` so the savings ratio measures
+      money off the *total* bill (ADR 0003). When ``None`` or all-zeros the
+      term is zero and behaviour is unchanged (regression-clean).
 
     The optimiser's ``expected_cost`` is then compared to this baseline to
     produce the "savings" ratio reported in the schedule and used as the
@@ -983,6 +998,8 @@ def _baseline_cost(
         start = int(pc.earliest_start_slot)
         for t in range(start, min(start + pc.cycle_slots, horizon_slots)):
             cost += float(pc.rated_kw) * float(prices[t]) * _PER_SLOT_FACTOR
+    if base_load is not None:
+        cost += float((base_load * prices).sum() * _PER_SLOT_FACTOR)
     return cost
 
 

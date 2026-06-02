@@ -760,3 +760,80 @@ def test_battery_as_dict_includes_battery_fields():
     assert len(d["battery_charge_kw"]) == H_DAY
     assert len(d["battery_discharge_kw"]) == H_DAY
     assert len(d["soc_kwh"]) == H_DAY
+
+
+# --------------------------------------------------------------------------- #
+# Bill-level Savings: Base Load cost in expected_cost and baseline_cost        #
+# --------------------------------------------------------------------------- #
+
+def test_base_load_cost_added_to_expected_and_baseline_cost():
+    """With base_load_kw supplied, both expected_cost and baseline_cost increase
+    by the Base-Load energy cost over the horizon."""
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _flat_prices()  # 50 EUR/MWh flat
+    base = np.full(H_DAY, 0.5)  # 0.5 kW constant base load
+
+    sched_no_base = solve_receding_horizon(now, prices, remaining_ev_kwh=0.0,
+                                           remaining_heater_kwh_by_window={7: 0.0, 18: 0.0})
+    sched_with_base = solve_receding_horizon(now, prices, remaining_ev_kwh=0.0,
+                                             remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+                                             base_load_kw=base)
+
+    # Base-Load cost = 0.5 kW × 96 slots × 0.25 h × 50 EUR/MWh / 1000 = 0.6 EUR
+    expected_base_cost = 0.5 * H_DAY * 0.25 * 50.0 / 1000.0
+    assert sched_with_base.expected_cost == pytest.approx(
+        sched_no_base.expected_cost + expected_base_cost, abs=1e-4
+    ), "expected_cost should increase by the Base-Load cost"
+    assert sched_with_base.baseline_cost == pytest.approx(
+        sched_no_base.baseline_cost + expected_base_cost, abs=1e-4
+    ), "baseline_cost should increase by the Base-Load cost"
+
+
+def test_full_base_load_peak_no_negative_forecast_cost_with_battery():
+    """A slot where the battery fully covers the Base-Load peak no longer yields
+    a negative forecast cost (reads ~0)."""
+    from aerogrid.config import BatterySpec
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    # Expensive peak price: battery discharges to offset base load.
+    prices = np.full(H_DAY, 150.0)
+    prices[0:20] = 20.0   # cheap overnight
+    base = np.asarray([0.4] * H_DAY, dtype=float)  # constant base load
+    batt = BatterySpec()
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0,
+        remaining_heater_kwh_by_window={7: 0.0, 18: 0.0},
+        battery_spec=batt, initial_soc_kwh=batt.capacity_kwh,  # start full
+        base_load_kw=base,
+    )
+    # expected_cost must be >= 0 (no phantom export revenue).
+    # A tiny negative from floating-point rounding is acceptable.
+    assert sched.expected_cost >= -1e-9, (
+        f"expected_cost={sched.expected_cost:.6f} should be >= 0 with base_load included"
+    )
+
+
+def test_no_base_load_is_regression_clean_for_costs():
+    """Without base_load_kw, expected_cost and baseline_cost are unchanged."""
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    prices = _cheap_overnight()
+    sched_legacy = solve_receding_horizon(now, prices, remaining_ev_kwh=5.0)
+    sched_zeros = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=5.0,
+        base_load_kw=np.zeros(H_DAY),
+    )
+    assert sched_legacy.expected_cost == pytest.approx(sched_zeros.expected_cost, abs=1e-6)
+    assert sched_legacy.baseline_cost == pytest.approx(sched_zeros.baseline_cost, abs=1e-6)
+
+
+def test_expected_cost_le_baseline_cost_with_base_load():
+    """expected_cost ≤ baseline_cost still holds when base_load_kw is supplied."""
+    now = datetime(2026, 4, 15, 18, 0, tzinfo=timezone.utc)
+    prices = _cheap_overnight()
+    base = np.full(H_DAY, 0.4)
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=24.0,
+        base_load_kw=base,
+    )
+    assert sched.expected_cost <= sched.baseline_cost + 1e-6, (
+        f"expected_cost={sched.expected_cost:.4f} > baseline_cost={sched.baseline_cost:.4f}"
+    )

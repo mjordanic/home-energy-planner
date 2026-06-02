@@ -383,12 +383,11 @@ INJECTED_PRICE_SPIKES: tuple[tuple[datetime, float], ...] = ()
 # --------------------------------------------------------------------------- #
 # Deterministic per-hour always-on inflexible demand: fridge compressor +
 # LED lighting + standby electronics + cooking.  One value per hour-of-day
-# (UTC).  Evening peak 17–22h; overnight ~0.2 kW; morning spike 07–09h.
-# Total ≈ 9.5 kWh/day.
+# (UTC).  Evening peak 17–21h (~0.75 kW); overnight 00–06h (~0.2 kW);
+# morning spike 07–08h (0.5 kW).  Total ≈ 9.95 kWh/day.
 #
 # Hour:  0     1     2     3     4     5     6     7     8     9    10    11
 #       12    13    14    15    16    17    18    19    20    21    22    23
-# Total ≈ 9.95 kWh/day.
 BASE_LOAD_PROFILE_KW: tuple[float, ...] = (
     0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20,  # 00–06: overnight
     0.50, 0.50, 0.40, 0.40, 0.40,               # 07–11: morning
