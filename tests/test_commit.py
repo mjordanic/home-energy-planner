@@ -147,3 +147,117 @@ def test_battery_no_soc_tracking_without_battery_spec():
     c.battery_charge_setpoint_kw = 5.0  # set a setpoint that should be ignored
     c.tick(datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc), dt_s=900.0)
     assert c.soc_kwh == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# No-export throttle: offsettable_load_kw                                      #
+# --------------------------------------------------------------------------- #
+
+def test_tick_without_offsettable_load_is_backward_compatible():
+    """tick() with no offsettable_load_kw behaves exactly as before (full setpoint applied)."""
+    batt = BatterySpec()
+    c = CommitTracker(battery_spec=batt, soc_kwh=5.0)
+    c.battery_discharge_setpoint_kw = 3.0
+    c.tick(datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc), dt_s=900.0)
+    expected_removed = 3.0 * (900.0 / 3600.0) / batt.eta_discharge
+    assert c.soc_kwh == pytest.approx(5.0 - expected_removed, abs=1e-6)
+    assert c.battery_discharge_applied_kw == pytest.approx(3.0)
+
+
+def test_tick_throttles_discharge_when_setpoint_exceeds_offsettable_load():
+    """When setpoint > offsettable_load + charge, discharge is throttled and SoC reflects it."""
+    batt = BatterySpec()
+    c = CommitTracker(battery_spec=batt, soc_kwh=5.0)
+    c.battery_discharge_setpoint_kw = 4.0  # setpoint 4 kW
+    c.battery_charge_setpoint_kw = 0.0
+    # Offsettable load is only 1.5 kW, so applied discharge = min(4, 1.5) = 1.5
+    c.tick(
+        datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc),
+        dt_s=900.0,
+        offsettable_load_kw=1.5,
+    )
+    assert c.battery_discharge_applied_kw == pytest.approx(1.5)
+    expected_removed = 1.5 * (900.0 / 3600.0) / batt.eta_discharge
+    assert c.soc_kwh == pytest.approx(5.0 - expected_removed, abs=1e-6)
+
+
+def test_tick_no_throttle_when_setpoint_within_offsettable_load():
+    """When setpoint ≤ offsettable_load, applied discharge equals the setpoint unchanged."""
+    batt = BatterySpec()
+    c = CommitTracker(battery_spec=batt, soc_kwh=5.0)
+    c.battery_discharge_setpoint_kw = 2.0
+    c.battery_charge_setpoint_kw = 0.0
+    c.tick(
+        datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc),
+        dt_s=900.0,
+        offsettable_load_kw=3.0,  # load (3 kW) ≥ setpoint (2 kW) — no throttle
+    )
+    assert c.battery_discharge_applied_kw == pytest.approx(2.0)
+    expected_removed = 2.0 * (900.0 / 3600.0) / batt.eta_discharge
+    assert c.soc_kwh == pytest.approx(5.0 - expected_removed, abs=1e-6)
+
+
+def test_battery_discharge_applied_kw_in_snapshot():
+    """battery_discharge_applied_kw is present in snapshot()."""
+    batt = BatterySpec()
+    c = CommitTracker(battery_spec=batt, soc_kwh=5.0)
+    c.battery_discharge_setpoint_kw = 4.0
+    c.tick(
+        datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc),
+        dt_s=900.0,
+        offsettable_load_kw=1.5,
+    )
+    snap = c.snapshot()
+    assert "battery_discharge_applied_kw" in snap
+    assert snap["battery_discharge_applied_kw"] == pytest.approx(1.5)
+
+
+def test_tick_throttle_zero_when_no_load():
+    """When offsettable_load_kw=0.0, discharge is fully throttled (net grid draw = 0)."""
+    batt = BatterySpec()
+    c = CommitTracker(battery_spec=batt, soc_kwh=5.0)
+    c.battery_discharge_setpoint_kw = 3.0
+    c.battery_charge_setpoint_kw = 0.0
+    c.tick(
+        datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc),
+        dt_s=1.0,
+        offsettable_load_kw=0.0,
+    )
+    assert c.battery_discharge_applied_kw == pytest.approx(0.0)
+    # SoC unchanged when applied is 0.
+    assert c.soc_kwh == pytest.approx(5.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# Integration: no-export invariant over a multi-slot battery-enabled run       #
+# --------------------------------------------------------------------------- #
+
+def test_no_export_over_multi_slot_run_with_shrinking_load():
+    """net_grid_kw ≥ 0 in every slot when discharge is forced into a shrinking load.
+
+    Scenario: battery is discharging at 3 kW setpoint. Household load
+    decreases slot by slot from 2.5 kW to 0.5 kW, so the raw setpoint would
+    drive net_grid negative in every slot. The throttle must cap applied
+    discharge to the available load.
+    """
+    batt = BatterySpec()
+    c = CommitTracker(battery_spec=batt, soc_kwh=10.0)
+    c.battery_discharge_setpoint_kw = 3.0
+    c.battery_charge_setpoint_kw = 0.0
+
+    loads_kw = [2.5, 2.0, 1.5, 1.0, 0.5, 0.0]
+    base_time = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+
+    for i, load in enumerate(loads_kw):
+        c.tick(base_time + timedelta(seconds=i), dt_s=1.0, offsettable_load_kw=load)
+        net_grid = load + c.battery_charge_setpoint_kw - c.battery_discharge_applied_kw
+        assert net_grid >= -1e-9, (
+            f"slot {i}: net_grid={net_grid:.6f} (load={load}, "
+            f"applied_dis={c.battery_discharge_applied_kw:.4f})"
+        )
+        # Billed discharge can never exceed the available offsettable load.
+        assert c.battery_discharge_applied_kw <= load + 1e-9
+        # Slot cost at any positive price is non-negative.
+        price = 100.0  # EUR/MWh
+        slot_cost = net_grid * (15 / 60) * (price / 1000.0)
+        assert slot_cost >= -1e-9, f"slot {i}: negative cost={slot_cost:.6f}"

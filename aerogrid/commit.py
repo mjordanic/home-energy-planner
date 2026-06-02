@@ -75,6 +75,10 @@ class CommitTracker:
     soc_kwh: float = 0.0
     battery_charge_setpoint_kw: float = 0.0
     battery_discharge_setpoint_kw: float = 0.0
+    # Applied (throttled) discharge from the most recent tick — the single
+    # source of truth for "how much the battery actually delivered this slot".
+    # Always ≤ battery_discharge_setpoint_kw; equals it when no throttle applies.
+    battery_discharge_applied_kw: float = 0.0
 
     # ------------------------------------------------------------------ #
     def _active_heater_window(self, now: datetime) -> int | None:
@@ -96,13 +100,26 @@ class CommitTracker:
         return best_hour
 
     # ------------------------------------------------------------------ #
-    def tick(self, now: datetime, dt_s: float = 1.0) -> None:
+    def tick(
+        self,
+        now: datetime,
+        dt_s: float = 1.0,
+        *,
+        offsettable_load_kw: float | None = None,
+    ) -> None:
         """Advance ``dt_s`` seconds of simulated wall time.
 
         Decrements EV and heater "remaining" counters according to current
         setpoints, retires expired committed tasks, and resets the daily
         EV need + each heater window's required kWh as the corresponding
         deadlines pass.
+
+        When the battery is discharging and *offsettable_load_kw* is
+        supplied, the applied discharge is throttled to
+        ``min(setpoint, offsettable_load_kw + charge_setpoint)`` so that
+        net grid draw never goes negative (no phantom export). SoC drains by
+        the *applied* amount, not the raw setpoint. When omitted the behaviour
+        is unchanged — every existing caller and test is unaffected.
         """
         if self.ev_power_setpoint_kw > 0.0:
             delivered = self.ev_power_setpoint_kw * dt_s / 3600.0
@@ -137,12 +154,29 @@ class CommitTracker:
                     energy_stored, self.soc_kwh,
                 )
             if self.battery_discharge_setpoint_kw > 0.0:
-                energy_released = self.battery_discharge_setpoint_kw * dt_s / 3600.0 / bspec.eta_discharge
+                # No-export throttle (ADR 0001): the battery can only discharge
+                # as much as the household load it offsets. When
+                # offsettable_load_kw is supplied we cap applied discharge to
+                # that load (plus any simultaneous charge draw). Without it we
+                # apply the full setpoint — backward-compatible.
+                if offsettable_load_kw is not None:
+                    applied_dis_kw = min(
+                        self.battery_discharge_setpoint_kw,
+                        max(0.0, offsettable_load_kw + self.battery_charge_setpoint_kw),
+                    )
+                else:
+                    applied_dis_kw = self.battery_discharge_setpoint_kw
+                self.battery_discharge_applied_kw = applied_dis_kw
+                energy_released = applied_dis_kw * dt_s / 3600.0 / bspec.eta_discharge
                 self.soc_kwh = max(0.0, self.soc_kwh - energy_released)
                 logger.debug(
-                    "CommitTracker.tick: battery discharge released=%.4f kWh soc=%.3f kWh",
+                    "CommitTracker.tick: battery discharge setpoint=%.4f applied=%.4f "
+                    "released=%.4f kWh soc=%.3f kWh",
+                    self.battery_discharge_setpoint_kw, applied_dis_kw,
                     energy_released, self.soc_kwh,
                 )
+            else:
+                self.battery_discharge_applied_kw = 0.0
 
         # Reset the daily EV target exactly at the deadline hour.
         if (
@@ -352,6 +386,7 @@ class CommitTracker:
             "soc_kwh": self.soc_kwh,
             "battery_charge_setpoint_kw": self.battery_charge_setpoint_kw,
             "battery_discharge_setpoint_kw": self.battery_discharge_setpoint_kw,
+            "battery_discharge_applied_kw": self.battery_discharge_applied_kw,
         }
 
 

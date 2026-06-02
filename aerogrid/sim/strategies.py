@@ -687,7 +687,25 @@ class OptimizerStrategy(Strategy):
         now = sample.t
 
         # 1. Advance commit-tracker state.
-        self.commit.tick(now, dt_s)
+        # For battery-enabled strategies, compute the household load that
+        # battery discharge can offset (EV + heater + running cycles + base
+        # load) so the no-export invariant (ADR 0001) is enforced on the
+        # realized 1 Hz path — not just in the forecast LP.
+        if self._battery_enabled:
+            running_kw = sum(
+                APPLIANCES[t.appliance].rated_kw
+                for t in self.commit.running_committed_tasks(now)
+            )
+            base_kw = get_base_load_kw(now, n_slots=1)[0]
+            offsettable_kw: float | None = (
+                self.commit.ev_power_setpoint_kw
+                + self.commit.heater_power_setpoint_kw
+                + running_kw
+                + base_kw
+            )
+        else:
+            offsettable_kw = None
+        self.commit.tick(now, dt_s, offsettable_load_kw=offsettable_kw)
 
         new_onsets = list(onsets)
         for onset in new_onsets:
@@ -926,10 +944,15 @@ class OptimizerStrategy(Strategy):
         soc = 0.0
         if self._battery_enabled:
             batt_chg_kw = self.commit.battery_charge_setpoint_kw
-            batt_dis_kw = self.commit.battery_discharge_setpoint_kw
+            # Use the *applied* (throttled) discharge — the amount that
+            # actually drained the SoC and offset household load this slot.
+            # This is always ≤ the setpoint; using it here ensures billed
+            # discharge matches the SoC drain and net_grid_kw ≥ 0 (ADR 0001).
+            batt_dis_kw = self.commit.battery_discharge_applied_kw
             soc = self.commit.soc_kwh
 
         # Net grid draw: gross loads + charge draw − discharge offset (ADR 0001).
+        # With applied (throttled) discharge, net_grid_kw is guaranteed ≥ 0.
         net_grid_kw = total_kw + batt_chg_kw - batt_dis_kw
 
         # Cost accrues on net grid draw for battery-enabled strategies,
