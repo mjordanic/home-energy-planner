@@ -17,6 +17,7 @@ You are the **Wave Runner**. The `/implement-issues` orchestrator has built a de
 - **Parallelism cap** (integer ≥ 1).
 - **Issue IDs** in this wave (list; orchestrator already filtered to pending).
 - **Feature slug** for branch naming.
+- **Per-issue implementer models** — a `{issue-id → model}` map, one entry per issue in your wave. Each value is an explicit model (`opus`/`sonnet`/`haiku`) or "default". The orchestrator already resolved these from CLI flags and each issue's `Complexity:`/`Model:` line — you do **not** re-derive them; you just apply each issue's value when you dispatch its `issue-implementer`. A named model goes through the Agent tool's `model` parameter (overriding the issue-implementer frontmatter); "default" (or a missing entry) means dispatch with **no** `model` parameter so the frontmatter default applies. Never substitute a hardcoded model.
 
 ## Workflow
 
@@ -25,6 +26,8 @@ You are the **Wave Runner**. The `/implement-issues` orchestrator has built a de
 2. **Decide dispatch mode.**
    - Wave has 1 issue OR cap == 1 → **in-place mode**.
    - Else → **worktree mode**.
+
+   In both dispatch modes below, dispatch each `issue-implementer` with the Agent tool's `model` parameter set to **that issue's** entry in the per-issue implementer-models map — unless its value is "default"/absent, in which case omit the `model` parameter and let the issue-implementer's frontmatter decide. Within one worktree-mode wave, different issues may run on different models.
 
 3. **In-place mode (single issue, no worktree).**
    Dispatch one `issue-implementer` subagent:

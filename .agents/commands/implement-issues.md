@@ -12,6 +12,17 @@ The wave-runner indirection is a context firewall: per-wave git activity, worktr
 
 - **Argument (optional)**: a feature folder path (e.g., `.scratch/<feature>/`). If omitted, infer the most recently modified `.scratch/<feature>/` directory. If two or more candidates were modified within 60s of each other, record an "ambiguous feature folder" preflight failure and exit.
 - **Parallelism cap (optional)**: default `3`. `cap == 1` ⇒ in-place sequential; `cap > 1` ⇒ worktree-per-issue parallel within each wave. Wave size is computed from the dependency graph, not assumed.
+- **Model selection (optional)**: choose the model backing each subagent role. Two independent knobs plus a shorthand:
+  - `--runner-model <model>` — model for the `wave-runner` subagent (git plumbing: worktrees, cherry-picks, report writes).
+  - `--implementer-model <model>` — model for the `issue-implementer` subagents (the TDD coding loop).
+  - `--model <model>` — shorthand that sets BOTH. An explicit `--runner-model` / `--implementer-model` wins over `--model` when both are supplied.
+  - Valid values: `opus`, `sonnet`, `haiku`. When a flag is given it overrides the subagent's `model:` frontmatter via the dispatching tool's per-call model parameter. **When a flag is omitted, pass no model parameter at all** — the subagent's own frontmatter default applies. Do not hardcode a default model here; the frontmatter is the single source of truth for it.
+  - **Resume**: on a resume run, an omitted flag inherits the value recorded in the existing report header (Phase 4 §1); a supplied flag overrides it; with neither, the role stays unpinned and its frontmatter default applies. The resolved selection (explicit model, or "default") is always (re)written to the header so a later resume stays consistent.
+  - **Per-issue complexity (automatic, implementer only).** When `--implementer-model` is *not* set, the implementer model is chosen **per issue** from a `Complexity:` line in the issue file (read in Phase 1). The runner model is never complexity-driven — coordinating git plumbing is mechanical regardless of issue size — so this layer applies only to `issue-implementer`. Per-issue resolution, first match wins:
+    1. a `Model:` line in the issue file (hard per-issue override),
+    2. the global `--implementer-model` / `--model` flag,
+    3. the issue's `Complexity:` mapping (Phase 1 policy: `high → opus`; `standard` / `low` / absent → unpinned),
+    4. the issue-implementer frontmatter default (no model parameter passed).
 
 ## Phase 0 — Preflight
 
@@ -24,17 +35,20 @@ Run FIRST, every invocation. **This is one of the two phases where you may ask t
 5. **PRD exists** — `<feature>/PRD.md` is present. If not, ask.
 6. **Permission audit** — read `.claude/settings.local.json` and compute which entries from the **Required Bash patterns** appendix are missing from the `permissions.allow` list. If any are missing, bundle the diff into Phase 1's wave-plan question as a single "apply these permission additions to `.claude/settings.local.json`?" prompt. If the user approves and the harness allows the edit, write the additions back atomically. If the harness hard-blocks the edit (settings files are commonly self-modification-protected), print the JSON patch as a copy-paste block, ask the user to apply it manually, and abort preflight; re-running the skill after the user updates settings will pass the audit. The orchestration phase never re-checks — it assumes the contract is in place once Phase 1 ends.
 
-Record `BASE_BRANCH`, started-at, and parallelism cap in the report header so resume runs can verify the same branch.
+7. **Model resolution (global tier).** Resolve the two *global* model knobs from the flags (see Inputs), falling back to the existing report header on a resume run: `runner-model` is final here (the runner is never complexity-driven), while `implementer-model` resolves only the global override tier — the per-issue refinement from each issue's `Complexity:`/`Model:` line happens in Phase 1 once the issue files are read. If neither flag nor header pins a role, leave it unpinned — the subagent's frontmatter default applies and you pass no model parameter for it. Validate any explicit value ∈ {`opus`, `sonnet`, `haiku`}. An unknown value is a preflight failure: ask the user to correct it (Phase 2+ is unattended, so bad model input must fail loud and early, never silently downgrade).
+
+Record `BASE_BRANCH`, started-at, parallelism cap, and the resolved `runner-model` / `implementer-model` selections (an explicit model, or "default") in the report header so resume runs can verify the same branch and reuse the same models.
 
 ## Phase 1 — Plan
 
 1. List every `*.md` under `<feature>/issues/` (skip `done/`).
-2. For each file, extract: ID (filename minus `.md`), Title (first H1), Status (`Status:` line), Blocked-by (`## Blocked by` section). Treat IDs already in `done/` as satisfied.
+2. For each file, extract: ID (filename minus `.md`), Title (first H1), Status (`Status:` line), Blocked-by (`## Blocked by` section), and — for model selection — an optional `Complexity:` line (`high` / `standard` / `low`) and an optional `Model:` line (`opus` / `sonnet` / `haiku`, a hard per-issue override). Both are optional; absent ⇒ that issue falls through to the next precedence tier. Treat IDs already in `done/` as satisfied.
 3. Keep only issues with `Status: ready-for-agent`. Skip the rest. **Exception**: if every file in the feature lacks a `Status:` line, surface this to the user and ask whether to treat them all as `ready-for-agent`. Record the answer in the report header.
 4. Build the dependency graph. **Cycles → ask the user.** Cycles indicate `/to-issues` produced non-vertical slices and need human review; do not invent a tie-breaker.
 5. Compute waves: wave N is every issue whose blockers are all done or in waves `< N`. If a wave is larger than the parallelism cap, split it into consecutive sub-waves of cap-sized chunks.
-6. **Present the wave plan to the user** and let them abort, reorder waves, drop issues, or adjust the parallelism cap. This is the **last point at which questions are allowed** — once you start Phase 2, the run is unattended.
-7. Write the initial report (schema in Phase 4) with every issue as `pending`.
+6. **Resolve each issue's implementer model** using the precedence in Inputs (`Model:` line → global `--implementer-model`/`--model` → `Complexity:` mapping → frontmatter default). Validate any `Model:` line and any mapped value ∈ {`opus`, `sonnet`, `haiku`}; an unknown value is a planning failure — ask the user. The mapping (`high → opus`; everything else → unpinned) is a small fixed policy block here, not a runtime flag; edit this file to retune it. Record the resolved model (explicit model, or "default") against each issue for the wave plan.
+7. **Present the wave plan to the user** — annotate each issue with its resolved implementer model so a complexity-driven `opus` pick is visible — and let them abort, reorder waves, drop issues, adjust the parallelism cap, or override any per-issue model. This is the **last point at which questions are allowed** — once you start Phase 2, the run is unattended.
+8. Write the initial report (schema in Phase 4) with every issue as `pending`.
 
 ## Phase 2 — Resume reconcile
 
@@ -55,7 +69,7 @@ Run EVERY invocation, even fresh. Cheap, idempotent, no external state.
 
 For each wave with at least one pending issue, sequentially:
 
-1. Dispatch ONE fresh `wave-runner` subagent. Pass:
+1. Dispatch ONE fresh `wave-runner` subagent. If `runner-model` is pinned, **set the Agent tool's `model` parameter to it** (overriding the wave-runner's frontmatter); if it is unpinned ("default"), omit the `model` parameter so the frontmatter applies. Pass in the prompt:
    - Repo root (absolute).
    - Feature path (absolute).
    - Report path (absolute).
@@ -64,6 +78,7 @@ For each wave with at least one pending issue, sequentially:
    - Parallelism cap.
    - List of pending issue IDs in this wave.
    - Feature slug (for branch naming).
+   - **Per-issue implementer models** — a `{issue-id → model}` map covering this wave's issues, each value an explicit model (`opus`/`sonnet`/`haiku`) or "default". The wave-runner can see neither your flags nor the issue files' `Complexity:`/`Model:` lines, so hand it the **already-resolved** model per issue (you computed these in Phase 1 step 6). "default" tells the wave-runner to omit the model parameter for that issue and let the issue-implementer frontmatter apply.
 2. Wait for the subagent's return summary (small `summary` block listing committed / failed / blocked / conflicts).
 3. Merge its counts into your running totals.
 4. **Continue to the next wave regardless of failures inside this one.** A failed wave does not cascade.
@@ -74,10 +89,10 @@ The wave-runner owns: worktree creation, dispatching `issue-implementer` subagen
 
 The report file is the contract between this skill, its wave-runners, and the human reviewer. It must contain, in this order:
 
-1. **Header** — feature name, link to `PRD.md`, started-at, last-updated, parallelism cap, integration branch (`BASE_BRANCH`), and any preflight assumptions (e.g., `Status:` lines missing across the board).
+1. **Header** — feature name, link to `PRD.md`, started-at, last-updated, parallelism cap, integration branch (`BASE_BRANCH`), resolved `runner-model` / `implementer-model`, and any preflight assumptions (e.g., `Status:` lines missing across the board).
 2. **Status table** — one row per scheduled issue: `ID | Title | Wave | Status | Worktree SHA | Integrated SHA | Started | Finished | Notes`. Statuses: `pending`, `in-progress`, `committed`, `failed`, `blocked`. Issue file at `done/` ⇔ report status `committed`. For in-place dispatches, Worktree SHA == Integrated SHA.
 3. **Dependency graph** — fenced ASCII or mermaid block.
-4. **Wave plan** — ordered list, member issues per wave.
+4. **Wave plan** — ordered list, member issues per wave, each issue annotated with its resolved implementer model (explicit, complexity-derived, or "default"). On resume this is re-derived deterministically from the issue files + Phase 1 policy, so an unedited issue keeps its model; the annotation is the human-visible record of what each wave will dispatch with.
 5. **Activity log** — append-only, timestamped one-liners for every state transition (commit SHAs, worktree paths, cherry-pick outcomes).
 6. **Outstanding follow-ups** — aggregated from subagent reports plus any cherry-pick conflicts.
 7. **Resume instructions** — re-run the skill with the same feature path; reconcile catches up.
