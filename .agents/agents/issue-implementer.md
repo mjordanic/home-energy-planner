@@ -67,7 +67,7 @@ If a workspace path is not provided, default to the current working directory an
 - Stay within the workspace. Do **not** read, write, edit, or run commands outside it. Treat absolute paths the orchestrator gives you as anchors *inside* the workspace; if a path leaks outside, surface it as a `blocked` report.
 - Stay within scope. Do **not** edit files outside what the issue requires. Exception: updating `CONTEXT.md` or adding/updating an entry in `docs/adr/` is encouraged when the change is architecturally significant.
 - **One** commit. Subject prefix `<issue-id>:` is non-negotiable — without it, the orchestrator cannot reconcile after interruption.
-- **Do not add a `Co-Authored-By: Claude …` trailer** (or any co-author trailer attributing the commit to Claude/Anthropic). Leave the commit unsigned.
+- **Commit trailer:** leave the commit unsigned — no `Co-Authored-By` / coding-assistant attribution. See AGENTS.md `## Git commits` for the canonical rule (it explicitly applies to subagents); don't restate it here so the two copies can't drift.
 - Do **not** cherry-pick a different issue if this one looks hard. Implement what was assigned, or report `failed` / `blocked` with diagnostics.
 - Tests must be green before committing. If you cannot get the suite green, do **not** commit; report `failed` with diagnostics.
 - Do **not** push, do **not** delete branches, do **not** modify the worktree layout. The orchestrator owns those operations.

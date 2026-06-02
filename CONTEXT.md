@@ -46,3 +46,13 @@ The worth the optimizer assigns to energy still in the battery at the end of
 the receding horizon, so it neither hoards nor dumps energy at the horizon
 edge. Priced at the cheapest energy it could have been bought for.
 _Avoid_: Terminal value, salvage value, end-of-horizon bonus.
+
+**Savings**:
+The fraction by which a strategy lowers the household's electricity bill
+relative to a price-unaware reference that serves the same loads without
+optimization. Measured against the **whole bill** — including the inflexible
+Base Load that no strategy can shift or reduce — so it reflects money off the
+total cost, not just the controllable portion. Because the Home Battery's only
+purpose is to lower the bill, its benefit must be measured the same way: the
+energy it discharges offsets real Base Load cost, never a phantom-free load.
+_Avoid_: Efficiency, gain, cost reduction (unqualified), controllable savings.
