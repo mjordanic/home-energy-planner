@@ -3,7 +3,22 @@
 > **This is a research demo, not production software.**  
 > It shows one end-to-end approach: real market prices → LP/MIP optimiser → LangGraph agent → human-in-the-loop HITL. Every component works, but most have known gaps listed at the bottom of this file.
 
-AeroGrid is a 1 Hz streaming agent that shifts deferrable household loads — EV charger, hot-water heater, dishwasher, washing machine — into cheap price slots, using real SMARD DE-LU wholesale prices and a receding-horizon LP/MIP solver inside a LangGraph loop.
+AeroGrid is a 1 Hz streaming agent that shifts deferrable household loads — EV charger, hot-water heater, dishwasher, washing machine — into cheap price slots, and dispatches a Home Battery to buffer grid energy, using real SMARD DE-LU wholesale prices and a receding-horizon LP/MIP solver inside a LangGraph loop. An always-on Base Load (fridge, lights, standby, cooking) is included as exogenous demand that neither strategy can shift.
+
+---
+
+## Devices
+
+| device | role | shifted by optimizer? |
+|---|---|---|
+| **EV Battery** (charger) | Deadline-driven load: must receive a fixed kWh by a daily deadline | Yes — LP picks the cheapest slots inside the EV window |
+| **Hot-water Heater** | Deadline-driven load: must deliver kWh by per-window deadlines | Yes — LP spreads power across window slots |
+| **Dishwasher** | User-triggered cycle: user starts it; HITL gate may shift it | Yes — MIP places it in the cheapest slot within the shift window |
+| **Washing Machine** | User-triggered cycle: same as dishwasher | Yes — MIP places it in the cheapest slot within the shift window |
+| **Home Battery** | Stationary storage: charges when cheap, discharges to offset load | Yes — LP decides `p_chg[t]` and `p_dis[t]` jointly with other loads |
+| **Base Load** | Always-on inflexible demand (fridge, lights, standby, cooking) | No — exogenous; added to every slot's load but not a decision variable |
+
+The **Home Battery** and the **EV Battery** are distinct devices with distinct roles. "Battery" alone is ambiguous — the codebase always qualifies it.
 
 ---
 
@@ -27,15 +42,17 @@ The **digital twin** owns only the simulation environment — the price feed, th
 │     4. at slot boundaries: collect SlotRecord → wide parquet row     │
 │     5. flush per-strategy events into shared event log               │
 └──────────────────────┬───────────────────────────────────────────────┘
-                       │ same inputs → both strategies
-          ┌────────────┴────────────┐
-          ▼                         ▼
-  BaselineStrategy          OptimizerStrategy
-  ─────────────────         ──────────────────
-  ASAP, no oracle           own price oracle
-  no graph                  own optimization and replanning
-  no CommitTracker          own CommitTracker
-                            own TriggerManager
+                       │ same inputs → three strategies
+     ┌─────────────────┼──────────────────────┐
+     ▼                 ▼                       ▼
+BaselineStrategy  OptimizerStrategy      OptimizerStrategy
+                  (no battery)           (Home Battery)
+─────────────     ─────────────          ──────────────────
+ASAP, no oracle   own price oracle       own price oracle
+no graph          own optimization       own optimization
+no CommitTracker  own CommitTracker      own CommitTracker
+                  own TriggerManager     own TriggerManager
+                  battery_enabled=False  battery_enabled=True
 ```
 
 The **OptimizerStrategy** runs a full agent loop:
@@ -65,14 +82,19 @@ Pure **LP** in the common case; collapses to a small **MIP** when `pending_cycle
 |---|---|
 | `p_ev[t]` | EV charging power (kW), zero outside availability window |
 | `p_heat[t]` | heater power (kW) |
+| `p_chg[t]` | Home Battery charge power (kW); only when `battery_spec` is passed |
+| `p_dis[t]` | Home Battery discharge power (kW); only when `battery_spec` is passed |
+| `soc[t]` | Home Battery state of charge at start of slot `t` (kWh) |
 | `s_a[t] ∈ {0,1}` | binary start indicator per pending cycle, per allowed slot |
 | `σ_ev, σ_heat[k]` | soft slack for EV and heater energy constraints |
 
-**Constraints:** charger rating + EV availability gate (C1) · EV energy deadline (C2, hard inside horizon / proportional outside) · heater per-window energy (C3) · heater rating (C4) · house power cap (C5) · pending cycle placement exactly once (C6).
+**Constraints:** charger rating + EV availability gate (C1) · EV energy deadline (C2, hard inside horizon / proportional outside) · heater per-window energy (C3) · heater rating (C4) · net grid draw cap + no-export (C5, with battery: `0 ≤ loads + p_chg − p_dis ≤ cap`) · pending cycle placement exactly once (C6) · SoC dynamics + bounds (C7, battery only: `soc[t+1] = soc[t] + η_c·p_chg[t]·Δt − p_dis[t]·Δt/η_d`).
 
-**Objective:** minimise forecast electricity cost + 1000 × slack penalties.
+**Base Load** is exogenous: a deterministic per-hour kW profile (≈ 9.95 kWh/day, evening-peaked) is added to every slot's load against the house cap. It is not a decision variable.
 
-**Fallback:** if every solver fails, the function returns a deterministic ASAP plan (EV charges from first open slot, heater runs from start of each window, cycles placed at `earliest_start_slot`).
+**Objective:** minimise forecast net-grid cost + 1000 × slack penalties − terminal reward. With a battery, the terminal reward `λ·soc[T]` (where `λ = min(price)/1000 × η_d`) prevents the optimizer from dumping stored energy at the horizon edge.
+
+**Fallback:** if every solver fails, the function returns a deterministic ASAP plan (EV charges from first open slot, heater runs from start of each window, cycles placed at `earliest_start_slot`, battery idles at 0 kW).
 
 ---
 
@@ -109,7 +131,7 @@ uv run python scripts/fetch_smard_prices.py
 # 4. Tests
 uv run pytest -q
 
-# 5. Full 16-day streaming simulation
+# 5. Full 16-day streaming simulation (three strategies: baseline, optimizer_nobatt, optimizer_batt)
 uv run python -m aerogrid.sim.digital_twin
 
 # Shorter smoke runs
@@ -129,6 +151,36 @@ Outputs land in `data/cache/`:
 | `event_log.parquet` | 1 s | one row per decision; uniform schema across strategies |
 | `run_log.jsonl` | per replan | full OptimizerStrategy plan detail |
 
+### Slot-log columns (per strategy prefix)
+
+Each strategy contributes a block of `<prefix>_*` columns to `slot_log.parquet`. Key fields:
+
+| column | type | description |
+|---|---|---|
+| `<prefix>_ev_kw` | float | EV charging power this slot (kW) |
+| `<prefix>_heater_kw` | float | Heater power this slot (kW) |
+| `<prefix>_base_load_kw` | float | Always-on Base Load (fridge, lights, standby, cooking) — exogenous, not shifted |
+| `<prefix>_battery_charge_kw` | float | Home Battery charge power (kW); 0 for non-battery strategies |
+| `<prefix>_battery_discharge_kw` | float | Home Battery discharge power (kW); 0 for non-battery strategies |
+| `<prefix>_soc_kwh` | float | Home Battery state of charge at slot start (kWh); 0 for non-battery strategies |
+| `<prefix>_net_grid_kw` | float | Net grid import: gross load + charge − discharge; equals total load when no battery |
+| `<prefix>_cumulative_cost` | float | Running cost accrued on `net_grid_kw` (not on gross load) |
+
+### Schedule fields (in `run_log.jsonl`)
+
+`Schedule` is the per-replan optimizer output, serialized into `run_log.jsonl`:
+
+| field | description |
+|---|---|
+| `ev_power_kw` | Per-slot EV charging power over the horizon (kW) |
+| `heater_power_kw` | Per-slot heater power over the horizon (kW) |
+| `battery_charge_kw` | Per-slot Home Battery charge power over the horizon (kW); empty list when no battery |
+| `battery_discharge_kw` | Per-slot Home Battery discharge power over the horizon (kW); empty list when no battery |
+| `soc_kwh` | Per-slot Home Battery SoC at slot start over the horizon (kWh); empty list when no battery |
+| `expected_cost` | Forecast net-grid cost of this plan (from price forecast, not realized prices) |
+| `baseline_cost` | Forecast cost of the ASAP naive baseline (same forecast), for savings comparison |
+| `solver_status` | HiGHS / ECOS / SCIPY / fallback status string |
+
 ---
 
 ## Key Design Choices
@@ -146,8 +198,8 @@ Outputs land in `data/cache/`:
 ```
 aerogrid/
   config.py          paths, date windows, horizons, HITL tolerances,
-                     EV / heater specs, APPLIANCE_ONSETS
-  types.py           Sample, ApplianceOnset, Schedule,
+                     EV / heater specs, BatterySpec, APPLIANCE_ONSETS
+  types.py           Sample, ApplianceOnset, Schedule (incl. battery fields),
                      RescheduleProposal, PendingCycle, …
   state.py           LangGraph TypedDict schema
   graph.py           outer-loop nodes:
@@ -164,6 +216,7 @@ aerogrid/
     streamer.py      1 Hz tick iterator + onset injection
     price_server.py  SMARD parquet feed + optional spike injection
     strategies.py    Strategy ABC + BaselineStrategy + OptimizerStrategy
+                     (battery_enabled flag) + SlotRecord
     digital_twin.py  orchestrator: streamer + price server +
                      cross-strategy gating + parquet writers
 
@@ -216,7 +269,7 @@ This is a demo. The following are real gaps worth addressing before any producti
 
 **Simulation fidelity**
 - The simulation ticks at 1 Hz but processes 15-min price slots. There is no intra-slot price variation.
-- No battery storage, no solar PV, no grid export.
+- No solar PV, no grid export. Battery discharge only offsets household load; export to the grid is excluded by the no-export constraint (C5).
 
 **Engineering gaps**
 - The `OptimizerStrategy` re-solves the full LP/MIP on every trigger. With a longer horizon or many pending cycles this becomes slow (a 48 h run takes ~6 min wall time on a laptop).
