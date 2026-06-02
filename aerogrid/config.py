@@ -16,13 +16,17 @@ loads as continuous variable-power and the rest as event-driven:
   hours forward) if it would save more than
   :data:`HITL_RESCHEDULE_MIN_SAVINGS_EUR`. Whether the simulated user
   accepts is per-appliance and lives in :data:`HITL_AUTO_RESPONSES`.
-* **Fridge** — always-on background load, never scheduled.
+* **Base Load** — deterministic always-on inflexible demand (fridge + lights
+  + standby + cooking) with an evening peak. Modelled as a per-hour kW
+  profile (see :data:`BASE_LOAD_PROFILE_KW`) that both strategies pay for
+  every slot. Not an ``ApplianceSpec`` — no decision variables, not
+  shiftable (ADR 0003). Replaces the previously-unwired ``fridge`` entry.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -86,9 +90,10 @@ class ApplianceSpec:
     ``cycle_slots`` is non-zero only for *event-driven cycle appliances*
     (dishwasher, washing machine) — appliances the user starts and that
     run a fixed-shape cycle of known length and rated power. The continuous
-    loads (EV, heater) and the always-on fridge use ``cycle_slots = 0``;
-    their behaviour is modelled by their own dedicated MILP variables
-    (EV / heater) or as constant background load (fridge).
+    loads (EV, heater) use ``cycle_slots = 0``; their behaviour is modelled
+    by their own dedicated MILP variables. Always-on background demand is
+    modelled by the deterministic :data:`BASE_LOAD_PROFILE_KW`, not by an
+    ``ApplianceSpec`` (ADR 0003).
     """
     name: str
     rated_kw: float
@@ -150,16 +155,8 @@ APPLIANCES: dict[str, ApplianceSpec] = {
         max_power_w=2000.0,
         bufferable=True,
     ),
-    # Fridge: always-on compressor cycling — not schedulable by the MILP.
-    # Adds realistic MinMax background noise to the aggregate trace.
-    "fridge": ApplianceSpec(
-        name="fridge",
-        rated_kw=0.15,
-        cycle_slots=0,                 # always-on baseline
-        on_power_threshold_w=10.0,
-        max_power_w=150.0,
-        bufferable=False,
-    ),
+    # NOTE: fridge removed — replaced by the deterministic Base Load profile
+    # (BASE_LOAD_PROFILE_KW + get_base_load_kw). ADR 0003.
 }
 
 
@@ -379,6 +376,89 @@ APPLIANCE_ONSETS: tuple[tuple[str, datetime], ...] = (
     _onset(18, _WM, 15, 45),
 )
 INJECTED_PRICE_SPIKES: tuple[tuple[datetime, float], ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# Base Load profile (ADR 0003)                                                #
+# --------------------------------------------------------------------------- #
+# Deterministic per-hour always-on inflexible demand: fridge compressor +
+# LED lighting + standby electronics + cooking.  One value per hour-of-day
+# (UTC).  Evening peak 17–21h (~0.75 kW); overnight 00–06h (~0.2 kW);
+# morning spike 07–08h (0.5 kW).  Total ≈ 9.95 kWh/day.
+#
+# Hour:  0     1     2     3     4     5     6     7     8     9    10    11
+#       12    13    14    15    16    17    18    19    20    21    22    23
+BASE_LOAD_PROFILE_KW: tuple[float, ...] = (
+    0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20,  # 00–06: overnight
+    0.50, 0.50, 0.40, 0.40, 0.40,               # 07–11: morning
+    0.40, 0.40, 0.40, 0.40, 0.40,               # 12–16: daytime
+    0.75, 0.75, 0.75, 0.75, 0.75,               # 17–21: evening peak (~0.75 kW)
+    0.40, 0.20,                                  # 22–23: wind-down
+)
+assert len(BASE_LOAD_PROFILE_KW) == 24, "BASE_LOAD_PROFILE_KW must have exactly 24 entries"
+
+
+def get_base_load_kw(now: datetime, n_slots: int) -> list[float]:
+    """Return a slot-aligned Base Load array of length ``n_slots``.
+
+    Slot 0 corresponds to the 15-minute slot that contains ``now``, floored
+    to the nearest slot boundary.  Each subsequent slot advances by
+    ``SLOT_MINUTES`` minutes.  The hour of each slot's start time determines
+    which entry of :data:`BASE_LOAD_PROFILE_KW` applies.
+
+    Args:
+        now: Current simulation time (UTC).  Used to anchor slot 0.
+        n_slots: Number of 15-min slots to produce.
+
+    Returns:
+        A list of ``n_slots`` floats, each the Base Load kW for that slot.
+    """
+    # Floor now to the start of the current slot.
+    slot0 = now.replace(
+        minute=(now.minute // SLOT_MINUTES) * SLOT_MINUTES,
+        second=0,
+        microsecond=0,
+    )
+    result: list[float] = []
+    for t in range(n_slots):
+        slot_t = slot0 + timedelta(minutes=SLOT_MINUTES * t)
+        result.append(BASE_LOAD_PROFILE_KW[slot_t.hour])
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Home Battery spec (ADR 0001, ADR 0002)                                      #
+# --------------------------------------------------------------------------- #
+# Physical constants for the stationary household battery.  Named with the
+# HOME_BATTERY_ prefix throughout to avoid any confusion with the EV battery.
+# Capacity: 13.5 kWh (Powerwall-class).  Max charge and discharge: 5 kW each.
+# Round-trip efficiency: η_c × η_d = 0.95 × 0.95 ≈ 90%.  No degradation cost.
+HOME_BATTERY_CAPACITY_KWH: float = 13.5
+HOME_BATTERY_MAX_POWER_KW: float = 5.0
+HOME_BATTERY_ETA_CHARGE: float = 0.95       # charge efficiency  (η_c)
+HOME_BATTERY_ETA_DISCHARGE: float = 0.95    # discharge efficiency (η_d)
+
+
+@dataclass(frozen=True)
+class BatterySpec:
+    """Physical spec for a stationary household battery.
+
+    Passed as an optional argument to :func:`aerogrid.optimizer.solve_receding_horizon`.
+    When ``None`` the battery is disabled and existing behaviour is unchanged.
+
+    Attributes:
+        capacity_kwh: Usable energy capacity (kWh). SoC is clamped to
+            ``[0, capacity_kwh]``.
+        max_charge_kw: Maximum charge power (kW). ``p_chg[t] ≤ max_charge_kw``.
+        max_discharge_kw: Maximum discharge power (kW). ``p_dis[t] ≤ max_discharge_kw``.
+        eta_charge: Charge efficiency ∈ (0, 1]. Energy stored = η_c × p_chg × Δt.
+        eta_discharge: Discharge efficiency ∈ (0, 1]. Energy released = p_dis × Δt / η_d.
+    """
+    capacity_kwh: float = HOME_BATTERY_CAPACITY_KWH
+    max_charge_kw: float = HOME_BATTERY_MAX_POWER_KW
+    max_discharge_kw: float = HOME_BATTERY_MAX_POWER_KW
+    eta_charge: float = HOME_BATTERY_ETA_CHARGE
+    eta_discharge: float = HOME_BATTERY_ETA_DISCHARGE
 
 
 def days_between(start: datetime, end: datetime) -> int:
