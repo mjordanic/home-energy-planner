@@ -305,17 +305,31 @@ def main() -> int:
         streamer.add_onset(appliance=appliance, timestamp=at)
 
     # ---- Strategies (each fully encapsulates its own private machinery) ---
-    # To add another strategy, instantiate it here and append to the list.
+    # Three strategies run in parallel over identical realized prices:
+    #   baseline         — price-unaware ASAP (no battery, no optimizer)
+    #   optimizer_nobatt — MPC optimizer, battery disabled
+    #   optimizer_batt   — MPC optimizer, battery enabled (home battery dispatched)
     baseline = BaselineStrategy()
-    optimizer = OptimizerStrategy(
+    optimizer_nobatt = OptimizerStrategy(
+        name="optimizer_nobatt",
         price_history_provider=server.history,
         price_oracle_impl=args.price_impl,
         horizon_slots=horizon_slots,
         auto_confirm=args.auto_confirm,
         auto_responses=HITL_AUTO_RESPONSES,
         replan_jsonl_path=args.replan_jsonl,
+        battery_enabled=False,
     )
-    strategies: list[Strategy] = [baseline, optimizer]
+    optimizer_batt = OptimizerStrategy(
+        name="optimizer_batt",
+        price_history_provider=server.history,
+        price_oracle_impl=args.price_impl,
+        horizon_slots=horizon_slots,
+        auto_confirm=args.auto_confirm,
+        auto_responses=HITL_AUTO_RESPONSES,
+        battery_enabled=True,
+    )
+    strategies: list[Strategy] = [baseline, optimizer_nobatt, optimizer_batt]
 
     # ---- Window selection ------------------------------------------------
     start = SIM_TEST_START

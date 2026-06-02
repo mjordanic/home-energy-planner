@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, TypedDict
 
+from aerogrid.config import BatterySpec
 from aerogrid.types import (
     ApplianceOnset,
     HITLDecision,
@@ -69,6 +70,14 @@ class AeroGridState(TypedDict, total=False):
     # to the cap-feasible decline-version when the user (or the simulated
     # user) chooses to decline. None whenever no proposal is pending.
     decline_plan: Schedule | None
+
+    # ---- Home Battery (optional — None disables battery) ---- #
+    # ``battery_spec`` is passed by OptimizerStrategy when battery_enabled=True.
+    # When None (the default), the optimizer runs in no-battery mode (same as before).
+    battery_spec: BatterySpec | None
+    # State-of-charge at the start of this replan horizon, mirrored from
+    # CommitTracker.soc_kwh by OptimizerStrategy.tick().
+    soc_kwh: float
 
     # ---- Monitoring / bookkeeping ---- #
     # Strategy-local running cost; populated by the OptimizerStrategy when it
