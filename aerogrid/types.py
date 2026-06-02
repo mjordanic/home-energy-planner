@@ -65,6 +65,9 @@ class Schedule:
     start slot for each pending cycle. Already-committed cycles (pinned by
     the commit tracker before the solve) appear in ``tasks`` with
     ``committed=True`` and consume cap headroom but are not re-decided.
+    When the caller passes a ``battery_spec``, the per-slot battery dispatch
+    (``battery_charge_kw``, ``battery_discharge_kw``, ``soc_kwh``) is also
+    populated; these stay empty lists otherwise.
     """
     slot_start: datetime                    # start of slot 0 (t=now rounded down)
     horizon_slots: int

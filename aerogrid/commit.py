@@ -4,6 +4,9 @@ The inner 1 Hz loop calls ``.tick(now, dt)`` every sample to:
 - decrement the EV's remaining kWh by its current setpoint,
 - decrement each heater deadline window's remaining kWh by the heater
   setpoint applied to that window,
+- advance battery SoC from the charge/discharge setpoints when a
+  ``battery_spec`` is set — discharge throttled to the offsettable load so
+  net grid draw never goes negative (no phantom export, ADR 0001),
 - retire committed cycle tasks whose duration has elapsed,
 - roll the remaining-EV counter at the daily EV deadline,
 - reset each heater window's remaining kWh as the deadline passes.
@@ -12,6 +15,8 @@ When the outer loop produces a plan and HITL approves it, the digital twin
 calls ``.adopt_plan(plan, now)`` to commit the plan's first slot:
 - the EV setpoint for the current 15-min slot is copied in,
 - the heater setpoint for the current 15-min slot is copied in,
+- the battery charge/discharge setpoints for the current slot are copied in
+  when the plan carries battery dispatch vectors,
 - any cycle task whose ``start_slot == 0`` becomes a committed task whose
   cycle cannot be rescheduled until it finishes.
 

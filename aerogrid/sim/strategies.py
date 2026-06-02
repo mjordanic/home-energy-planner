@@ -14,7 +14,7 @@ Per simulation tick, the digital twin hands every strategy
 
   ``tick(sample, onsets, dt_s=1.0)``
 
-and lets each strategy decide what to do.  Both strategies see the same
+and lets each strategy decide what to do.  Every strategy sees the same
 onsets — there is no NILM in the loop, so the comparison is symmetric.
 
 Cross-strategy onset gating
@@ -552,8 +552,9 @@ class OptimizerStrategy(Strategy):
     price history belongs to the simulation environment, not the strategy.
 
     Multiple OptimizerStrategy instances can be run side by side with
-    different ``price_oracle_impl`` values — each owns its own graph, so
-    there is no hidden cross-talk.
+    different ``price_oracle_impl`` values or ``battery_enabled`` settings
+    (e.g. one battery-off and one battery-on) — each owns its own graph and
+    :class:`~aerogrid.commit.CommitTracker`, so there is no hidden cross-talk.
     """
 
     def __init__(

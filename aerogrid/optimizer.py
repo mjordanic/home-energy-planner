@@ -45,6 +45,18 @@ small forward shift via the HITL gate. Their already-running cycles do
 appear here as exogenous load through ``committed_tasks`` (their rated
 power consumes cap headroom for the slots they still occupy).
 
+When a battery is configured (the caller passes ``battery_spec``), two
+further *continuous* controls are co-optimised: the battery charge power
+``p_chg[t]`` and discharge power ``p_dis[t]``, linked by the state-of-charge
+``soc[t]`` (see C7). No binaries are added — round-trip losses alone deter
+simultaneous charge/discharge, so the program stays a pure LP.
+
+An exogenous **Base Load** (``base_load_kw``) — the always-on inflexible
+household demand (fridge + lights + standby + cooking) — is added to the
+per-slot load against the house cap. It carries no decision variables and
+counts towards no energy constraint; it only consumes cap headroom and
+accrues cost.
+
 Decision variables
 ==================
 
@@ -56,9 +68,19 @@ Decision variables
                                        constraint (kWh shortfall).
 * ``σ_heat[w] ≥ 0``                 — soft slack on the heater energy for
                                        deadline-window ``w`` (kWh).
+* ``p_chg[t] ≥ 0``                  — battery charge power in slot ``t`` (kW);
+                                       only when ``battery_spec`` is supplied.
+* ``p_dis[t] ≥ 0``                  — battery discharge power in slot ``t``
+                                       (kW); only when ``battery_spec`` is
+                                       supplied.
+* ``soc[t] ∈ [0, capacity]``        — battery state-of-charge at the *start*
+                                       of slot ``t`` (kWh). Has ``T + 1``
+                                       entries so ``soc[T]`` feeds the
+                                       terminal reward.
 
-There are no binary variables, so the program is a convex LP and HiGHS
-solves it deterministically in milliseconds.
+Absent pending cycles the program has no binary variables and is a convex LP
+that HiGHS solves deterministically in milliseconds; the battery adds only
+continuous variables and keeps it an LP.
 
 Unit conversion
 ===============
@@ -127,17 +149,22 @@ C4. **Heater rating** ::
 
 C5. **Aggregate house power cap** — at every slot ``t``::
 
-        p_ev[t] + p_heat[t]
+        load[t] = p_ev[t] + p_heat[t] + base_load[t]
             + Σ_{c ∈ committed_tasks: t ∈ [c.start, c.start+L_c)} P_c
             + Σ_{a ∈ pending_cycles} z_a[t] · P_a
-        ≤ P_max
+
+        load[t] ≤ P_max                              (no battery)
+        0 ≤ load[t] + p_chg[t] − p_dis[t] ≤ P_max    (with battery)
 
     Committed tasks contribute their rated power as a constant load against
     the cap during the slots they still occupy. *Pending* cycles
     (user-triggered onsets awaiting a HITL response) appear through the
     derived "is-running" indicator ``z_a[t] = Σ_{k=0..L_a−1} s_a[t−k]``
     where ``s_a[t]`` is the binary start indicator described under C6 and
-    ``z_a[t] ∈ {0, 1}`` by construction.
+    ``z_a[t] ∈ {0, 1}`` by construction. The exogenous ``base_load[t]`` adds
+    to the load against the cap. With a battery the *net grid draw*
+    ``load[t] + p_chg[t] − p_dis[t]`` is additionally floored at zero — the
+    battery may not export to the grid (ADR 0001).
 
 C6. **Pending cycle placement** — for each pending cycle ``a`` with
     ``cycle_slots = L_a``, ``rated_kw = P_a``, and allowed-start interval
@@ -152,10 +179,24 @@ C6. **Pending cycle placement** — for each pending cycle ``a`` with
     "run now"). The chosen start slot is reported back through
     ``Schedule.cycle_starts``.
 
+C7. **Battery SoC dynamics and bounds** (only when ``battery_spec`` is
+    supplied) — tie charge/discharge to the state-of-charge and keep it
+    inside the pack's usable range::
+
+        soc[0]   = clip(initial_soc_kwh, 0, capacity)
+        soc[t+1] = soc[t] + η_c · p_chg[t] · Δt − p_dis[t] · Δt / η_d,   ∀ t
+        0 ≤ soc[t] ≤ capacity
+        0 ≤ p_chg[t] ≤ P_chg_max,   0 ≤ p_dis[t] ≤ P_dis_max
+
+    Charging is lossy by ``η_c`` and discharging by ``η_d``; the round-trip
+    loss alone makes simultaneous charge/discharge suboptimal, so no binary
+    interlock is needed and the program stays an LP.
+
 Objective
 =========
 
-Two terms — the realised electricity bill plus the slack penalty::
+With no battery, two terms — the realised electricity bill plus the slack
+penalty::
 
     minimise   C_actual  +  ρ · (σ_ev + Σ_w σ_heat[w])
 
@@ -165,6 +206,23 @@ forecast price::
     C_actual = κ · Σ_t π[t] · (p_ev[t] + p_heat[t])
              + κ · Σ_t π[t] · Σ_{c ∈ committed} P_c · 1[t ∈ c.range]
              + κ · Σ_t π[t] · Σ_{a ∈ pending}   P_a · z_a[t]
+
+The exogenous Base Load also incurs cost, but it is a constant offset
+independent of the decision variables, so it is folded into the reported
+``expected_cost`` afterwards rather than into the objective.
+
+When a battery is present, two further terms are added::
+
+    + κ · Σ_t π[t] · (p_chg[t] − p_dis[t])    — battery net grid cost
+    − λ · soc[T]                              — terminal value of stored energy
+
+Charging draws from the grid (a cost) while discharging offsets load that
+would otherwise be imported (a saving), so the optimiser is rewarded for
+shifting discharge into expensive slots. The terminal reward, with
+``λ = (min_t π[t] / 1000) · η_d``, prices the energy still stored at the end
+of the horizon at roughly its cheapest acquisition cost — preventing the
+optimiser from dumping the pack at the horizon edge or refusing to charge
+because the payoff falls beyond ``T`` (ADR 0002).
 
 Every controlled load strictly *needs* to deliver its energy (EV deadline,
 heater windows, pending cycles via C6), so the optimiser will always start
@@ -183,8 +241,9 @@ deterministic fallback schedule that:
 * charges the EV ASAP at rated power inside the availability window until
   ``remaining_ev_kwh`` is satisfied or the horizon ends,
 * runs the heater at rated power inside each deadline window until the
-  required kWh is delivered, and
-* places each pending cycle at its ``earliest_start_slot`` (i.e. "run now").
+  required kWh is delivered,
+* places each pending cycle at its ``earliest_start_slot`` (i.e. "run now"), and
+* idles the battery (``p_chg = p_dis = 0``, SoC held at ``initial_soc_kwh``).
 
 This guarantees the caller always has an actionable plan even if the
 solver chain breaks.
@@ -195,15 +254,18 @@ Baseline cost (for savings reporting)
 ``_baseline_cost`` evaluates a price-unaware "naive scheduler": EV charges
 ASAP starting from the first available slot in the EV window, and the
 heater runs at rated power starting from the first slot of each deadline
-window. The ratio ``(baseline − expected) / baseline`` is reported as the
-plan's "savings" and is the headline metric used in the notebooks.
+window. It also includes the same exogenous Base Load that ``expected_cost``
+carries, so the savings ratio measures money off the *total* bill (ADR 0003).
+The ratio ``(baseline − expected) / baseline`` is reported as the plan's
+"savings" and is the headline metric used in the notebooks.
 
 Reproducibility
 ===============
 
 The optimisation is fully deterministic given ``(now, prices,
-remaining_ev_kwh, remaining_heater_kwh_by_window, committed_tasks)`` plus
-the configuration constants in :mod:`aerogrid.config`. The price oracle is
+remaining_ev_kwh, remaining_heater_kwh_by_window, committed_tasks,
+base_load_kw, battery_spec, initial_soc_kwh)`` plus the configuration
+constants in :mod:`aerogrid.config`. The price oracle is
 the only stochastic upstream; once its output is fixed, the LP is
 reproducible to within solver-tolerance.
 """
@@ -467,12 +529,15 @@ def solve_receding_horizon(
         :class:`~aerogrid.types.Schedule` populated with ``ev_power_kw``,
         ``heater_power_kw``, ``heater_window_kwh`` (per-deadline planned
         kWh), ``tasks`` (echoed committed cycles only), ``expected_cost``,
-        ``baseline_cost``, and ``solver_status``.
+        ``baseline_cost``, and ``solver_status``. When ``battery_spec`` is
+        supplied, the per-slot ``battery_charge_kw``, ``battery_discharge_kw``,
+        and ``soc_kwh`` vectors are populated as well (empty lists otherwise).
 
         On total solver failure (or non-optimal status) the function falls
-        back to charging the EV ASAP within its availability window and
-        running the heater at rated power inside each deadline window. This
-        guarantees the caller always has an actionable plan.
+        back to charging the EV ASAP within its availability window, running
+        the heater at rated power inside each deadline window, and idling the
+        battery (SoC held at ``initial_soc_kwh``). This guarantees the caller
+        always has an actionable plan.
     """
     # --- 0. Resolve defaults ------------------------------------------------ #
     appliances = appliances or APPLIANCES

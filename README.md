@@ -88,11 +88,29 @@ Pure **LP** in the common case; collapses to a small **MIP** when `pending_cycle
 | `s_a[t] ∈ {0,1}` | binary start indicator per pending cycle, per allowed slot |
 | `σ_ev, σ_heat[k]` | soft slack for EV and heater energy constraints |
 
-**Constraints:** charger rating + EV availability gate (C1) · EV energy deadline (C2, hard inside horizon / proportional outside) · heater per-window energy (C3) · heater rating (C4) · net grid draw cap + no-export (C5, with battery: `0 ≤ loads + p_chg − p_dis ≤ cap`) · pending cycle placement exactly once (C6) · SoC dynamics + bounds (C7, battery only: `soc[t+1] = soc[t] + η_c·p_chg[t]·Δt − p_dis[t]·Δt/η_d`).
+**Constraints** — the physical and contractual limits the plan must respect:
+
+- **C1 — EV charger rating + availability gate.** The EV can only draw up to its rated power, and only while it's plugged in (`p_ev[t] = 0` outside the availability window).
+- **C2 — EV energy deadline.** The EV must have its required kWh by the deadline hour. If the deadline falls inside the horizon it's enforced hard at that slot; if it's beyond the horizon, this horizon must deliver its proportional share (plus a safety margin) so charging isn't deferred forever.
+- **C3 — heater per-window energy.** Each heater deadline defines a window (gap since the previous deadline); the heater must deliver that window's kWh by the time the deadline hour arrives.
+- **C4 — heater rating.** The heater can't draw more than its rated power in any slot.
+- **C5 — house power cap + no-export.** Total draw in every slot (Base Load + EV + heater + battery charge − battery discharge) stays between 0 and the house cap — never exceeding the grid connection, and never pushing power back to the grid (`0 ≤ loads + p_chg − p_dis ≤ cap`).
+- **C6 — pending cycle placement.** Each deferrable cycle appliance (dishwasher, washing machine) awaiting a decision is scheduled to start in exactly one allowed slot.
+- **C7 — battery SoC dynamics + bounds** *(battery only)*. State of charge evolves slot-to-slot with charge/discharge efficiencies (`soc[t+1] = soc[t] + η_c·p_chg[t]·Δt − p_dis[t]·Δt/η_d`) and stays within the battery's min/max capacity.
+
+The EV and heater energy targets (C2, C3) are enforced as **soft** constraints via slack variables (`σ_ev`, `σ_heat`): rather than making the problem infeasible when the power cap makes a target unreachable, the shortfall is allowed but heavily penalized in the objective.
 
 **Base Load** is exogenous: a deterministic per-hour kW profile (≈ 9.95 kWh/day, evening-peaked) is added to every slot's load against the house cap. It is not a decision variable.
 
-**Objective:** minimise forecast net-grid cost + 1000 × slack penalties − terminal reward. With a battery, the terminal reward `λ·soc[T]` (where `λ = min(price)/1000 × η_d`) prevents the optimizer from dumping stored energy at the horizon edge.
+**Objective** — what the optimizer minimizes:
+
+```
+forecast net-grid cost  +  1000 × (energy slacks)  −  terminal reward
+```
+
+- **Forecast net-grid cost** is the electricity bill: each slot's net grid draw (in kWh) times that slot's forecast price, summed over the horizon. Shifting loads into cheap slots is what lowers this term.
+- **1000 × slack penalties** makes any C2/C3 energy shortfall expensive, so the optimizer only ever leaves a target unmet when the power cap physically forces it to — and even then, by the smallest possible amount.
+- **Terminal reward** *(battery only)* values energy still stored at the end of the horizon: `λ·soc[T]` with `λ = min(price)/1000 × η_d`. Without it the optimizer would dump the battery in the final slots (stored energy looks worthless past the horizon edge); the reward prices it at roughly the cheapest price seen, so the battery is held for the next window instead.
 
 **Fallback:** if every solver fails, the function returns a deterministic ASAP plan (EV charges from first open slot, heater runs from start of each window, cycles placed at `earliest_start_slot`, battery idles at 0 kW).
 
