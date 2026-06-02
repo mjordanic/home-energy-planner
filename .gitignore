@@ -1,6 +1,7 @@
 .venv/
 .env
 .vscode/
+.claude/settings.local.json
 __pycache__/
 *.pyc
 *.pyo

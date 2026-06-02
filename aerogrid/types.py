@@ -79,6 +79,12 @@ class Schedule:
     baseline_cost: float = 0.0
     solver_status: str = "unknown"
     committed_until: datetime | None = None   # first N slots committed as of this plan
+    # Per-slot Home Battery dispatch vectors (length = horizon_slots).
+    # All three default to empty lists so callers that don't use the battery
+    # never see None values — they just get empty lists.
+    battery_charge_kw: list[float] = field(default_factory=list)      # p_chg[t]
+    battery_discharge_kw: list[float] = field(default_factory=list)   # p_dis[t]
+    soc_kwh: list[float] = field(default_factory=list)                 # soc[t]
 
     def savings(self) -> float:
         """Return fractional cost savings vs. the naive baseline: ``(baseline − expected) / baseline``."""
@@ -103,6 +109,9 @@ class Schedule:
             "committed_until": (
                 self.committed_until.isoformat() if self.committed_until else None
             ),
+            "battery_charge_kw": [float(p) for p in self.battery_charge_kw],
+            "battery_discharge_kw": [float(p) for p in self.battery_discharge_kw],
+            "soc_kwh": [float(s) for s in self.soc_kwh],
         }
 
 

@@ -218,6 +218,7 @@ import numpy as np
 
 from aerogrid.config import (
     APPLIANCES,
+    BatterySpec,
     EV_AVAILABLE_FROM_HOUR,
     EV_DAILY_NEED_KWH,
     EV_DEADLINE_HOUR,
@@ -393,6 +394,9 @@ def solve_receding_horizon(
     heater_deadlines: tuple[HeaterEnergyDeadline, ...] | None = None,
     ev_available_from_hour: int = EV_AVAILABLE_FROM_HOUR,
     ev_deadline_hour: int = EV_DEADLINE_HOUR,
+    base_load_kw: np.ndarray | None = None,
+    battery_spec: BatterySpec | None = None,
+    initial_soc_kwh: float = 0.0,
 ) -> Schedule:
     """Solve the receding-horizon LP for the next ``horizon_slots`` slots.
 
@@ -441,6 +445,23 @@ def solve_receding_horizon(
         heater_deadlines: Override of :data:`aerogrid.config.HEATER_DEADLINES`.
         ev_available_from_hour, ev_deadline_hour: Override the EV charging
             window boundaries.
+        base_load_kw: Optional per-slot always-on inflexible demand array
+            of length ``horizon_slots`` (kW).  Defaults to zeros when
+            ``None``, which preserves existing optimizer behaviour exactly
+            (regression-clean no-op).  The base load is added to the
+            per-slot load against the house cap but is **exogenous** — it
+            does not appear in ``ev_power_kw`` or ``heater_power_kw`` and
+            does not count towards the EV/heater energy constraints.
+        battery_spec: Optional :class:`~aerogrid.config.BatterySpec`.
+            When ``None`` (default) no battery is modelled and the
+            function output is identical to the pre-battery behaviour.
+            When supplied, three decision variables ``p_chg[t]``,
+            ``p_dis[t]``, and ``soc[t]`` are added to the LP (no binary
+            variables — round-trip losses alone deter simultaneous
+            charge/discharge, keeping the program a pure LP).
+        initial_soc_kwh: State-of-charge at the start of the horizon (kWh).
+            Defaults to 0 (battery starts empty).  Maintained across
+            replans by :class:`~aerogrid.commit.CommitTracker`.
 
     Returns:
         :class:`~aerogrid.types.Schedule` populated with ``ev_power_kw``,
@@ -489,6 +510,18 @@ def solve_receding_horizon(
     horizon_h = horizon_slots * _SLOT_HOURS
     slot0 = _floor_slot(now)
 
+    # Normalise base_load_kw to a length-horizon_slots float array.
+    # Defaults to zeros → regression-clean no-op when caller omits it.
+    if base_load_kw is None:
+        _base_load = np.zeros(horizon_slots, dtype=float)
+    else:
+        _base_load = np.asarray(base_load_kw, dtype=float).reshape(-1)
+        if _base_load.size < horizon_slots:
+            _base_load = np.concatenate(
+                [_base_load, np.zeros(horizon_slots - _base_load.size)]
+            )
+        _base_load = _base_load[:horizon_slots]
+
     if time_to_deadline_h is None:
         time_to_deadline_h = time_to_deadline_hours(now, ev_deadline_hour)
     deadline_in_horizon = time_to_deadline_h <= horizon_h
@@ -512,6 +545,20 @@ def solve_receding_horizon(
     p_heat = cp.Variable(horizon_slots, nonneg=True)
     slack_ev = cp.Variable(nonneg=True)
     slack_heat: dict[int, cp.Variable] = {h: cp.Variable(nonneg=True) for h in heater_masks}
+
+    # Battery decision variables — only created when battery_spec is provided.
+    # p_chg[t] ≥ 0 : charge power at slot t (kW)
+    # p_dis[t] ≥ 0 : discharge power at slot t (kW)
+    # soc[t]       : state-of-charge at *start* of slot t (kWh)
+    p_chg: cp.Variable | None = None
+    p_dis: cp.Variable | None = None
+    soc: cp.Variable | None = None
+    if battery_spec is not None:
+        p_chg = cp.Variable(horizon_slots, nonneg=True)
+        p_dis = cp.Variable(horizon_slots, nonneg=True)
+        # soc has horizon_slots + 1 entries: soc[0]..soc[T], where soc[0] is
+        # the given initial_soc_kwh and soc[T] appears in the terminal reward.
+        soc = cp.Variable(horizon_slots + 1, nonneg=True)
 
     # C1: per-slot upper bound is rated_kw inside the EV charging window
     # and zero outside. Combined with ``nonneg=True`` this fully realises
@@ -587,21 +634,63 @@ def solve_receding_horizon(
         )
 
     # --- 5. C5: house power cap at every slot ------------------------------- #
+    # net_grid[t] = controllable loads + base_load + p_chg[t] − p_dis[t]
+    # With a battery: 0 ≤ net_grid[t] ≤ cap  (no export, ADR 0001).
+    # Without a battery: identical to old gross-load ≤ cap.
     for t in range(horizon_slots):
-        load_t = p_ev[t] + p_heat[t]
+        load_t = p_ev[t] + p_heat[t] + float(_base_load[t])
         for task in committed_list:
             if task.start_slot <= t < task.start_slot + task.slots:
                 load_t = load_t + appliances[task.appliance].rated_kw
         for pc, _s_a, z_a_per_slot in pending_data:
             if not isinstance(z_a_per_slot[t], (int, float)) or z_a_per_slot[t] != 0.0:
                 load_t = load_t + pc.rated_kw * z_a_per_slot[t]
-        constraints.append(load_t <= house_cap_kw)
+        if battery_spec is not None:
+            # net_grid = loads + charge − discharge
+            net_grid_t = load_t + p_chg[t] - p_dis[t]
+            constraints.append(net_grid_t <= house_cap_kw)   # cap on import
+            constraints.append(net_grid_t >= 0.0)             # no export (ADR 0001)
+        else:
+            constraints.append(load_t <= house_cap_kw)
+
+    # --- 5b. Battery physics constraints ------------------------------------ #
+    if battery_spec is not None:
+        bspec = battery_spec
+        # Initial SoC (clamped to valid range).
+        soc0 = float(np.clip(initial_soc_kwh, 0.0, bspec.capacity_kwh))
+        constraints.append(soc[0] == soc0)
+
+        # Power bounds.
+        constraints.append(p_chg <= bspec.max_charge_kw)
+        constraints.append(p_dis <= bspec.max_discharge_kw)
+
+        # SoC dynamics and bounds.
+        for t in range(horizon_slots):
+            # soc[t+1] = soc[t] + η_c·p_chg[t]·Δt − p_dis[t]·Δt/η_d
+            constraints.append(
+                soc[t + 1]
+                == soc[t]
+                + bspec.eta_charge * p_chg[t] * _SLOT_HOURS
+                - p_dis[t] * _SLOT_HOURS / bspec.eta_discharge
+            )
+            constraints.append(soc[t + 1] <= bspec.capacity_kwh)
+            # soc[t+1] ≥ 0 is guaranteed by nonneg=True on the soc variable.
 
     # --- 6. Objective ------------------------------------------------------- #
     actual_cost = (
         cp.sum(cp.multiply(p_ev, prices)) * _PER_SLOT_FACTOR
         + cp.sum(cp.multiply(p_heat, prices)) * _PER_SLOT_FACTOR
     )
+    # Battery net cost = charging costs − discharge savings.
+    # p_chg[t] draws from the grid → costs π[t] per kWh.
+    # p_dis[t] offsets load that would otherwise be drawn from the grid → saves π[t] per kWh.
+    # Including both terms gives the optimizer a real incentive to discharge at peak price.
+    battery_net_cost: cp.Expression | float = 0.0
+    if battery_spec is not None:
+        battery_net_cost = (
+            cp.sum(cp.multiply(p_chg, prices)) * _PER_SLOT_FACTOR
+            - cp.sum(cp.multiply(p_dis, prices)) * _PER_SLOT_FACTOR
+        )
     # Pending cycles: their cost depends on which slot the MIP picks via
     # z_a[t], so it's part of the optimisation. We sum p_a · π · κ across
     # the horizon for each pending cycle.
@@ -621,8 +710,29 @@ def solve_receding_horizon(
         for t in range(task.start_slot, min(task.start_slot + task.slots, horizon_slots)):
             committed_cost += rated * float(prices[t]) * _PER_SLOT_FACTOR
 
+    # Compute min_price and λ once; reused for both the terminal reward (objective)
+    # and the expected_cost back-out (section 8b). Avoids drift between the two.
+    min_price: float = float(prices.min()) if prices.size else 0.0
+    lambda_val: float = (
+        (min_price / 1000.0) * battery_spec.eta_discharge
+        if battery_spec is not None
+        else 0.0
+    )
+
+    # Value-of-stored-energy terminal reward (ADR 0002): reward leftover SoC at
+    # horizon end at its cheapest acquisition cost × η_d.  This prevents both
+    # edge-dumping (battery drains before T) and myopic under-charging (battery
+    # refuses to charge because the horizon ends before the payoff slot).
+    #   λ = (min(π) / 1000) × η_d   [$/kWh delivered]
+    # Adding -λ·soc[T] to a minimisation objective rewards storing energy.
+    terminal_reward: cp.Expression | float = 0.0
+    if battery_spec is not None:
+        terminal_reward = -lambda_val * soc[horizon_slots]
+
     slack_term = _SLACK_PENALTY * (slack_ev + sum(slack_heat.values()))
-    obj = cp.Minimize(actual_cost + pending_cost + slack_term)
+    obj = cp.Minimize(
+        actual_cost + battery_net_cost + pending_cost + slack_term + terminal_reward
+    )
     prob = cp.Problem(obj, constraints)
 
     # --- 7. Solver chain ---------------------------------------------------- #
@@ -695,6 +805,12 @@ def solve_receding_horizon(
         sched.heater_power_kw = [float(x) for x in heater_plan]
         sched.heater_window_kwh = {int(k): float(v) for k, v in window_kwh.items()}
         sched.cycle_starts = fallback_cycle_starts
+        # Battery fallback: idle (p_chg = p_dis = 0, soc constant at initial_soc_kwh).
+        if battery_spec is not None:
+            soc0 = float(np.clip(initial_soc_kwh, 0.0, battery_spec.capacity_kwh))
+            sched.battery_charge_kw = [0.0] * horizon_slots
+            sched.battery_discharge_kw = [0.0] * horizon_slots
+            sched.soc_kwh = [soc0] * horizon_slots
         # Cost contribution from pending cycles in the fallback (running now).
         fallback_pending_cost = 0.0
         for pc in pending_list:
@@ -719,6 +835,18 @@ def solve_receding_horizon(
         int(h): float(np.asarray(p_heat.value)[m].sum() * _SLOT_HOURS)
         for h, m in heater_masks.items()
     }
+    # Unpack battery solution: clamp small negative values from solver tolerance.
+    if battery_spec is not None:
+        sched.battery_charge_kw = [
+            float(max(0.0, v)) for v in p_chg.value
+        ]
+        sched.battery_discharge_kw = [
+            float(max(0.0, v)) for v in p_dis.value
+        ]
+        # soc[0..T]: return slots 0..T-1 (per-slot start-of-slot SoC).
+        sched.soc_kwh = [
+            float(max(0.0, v)) for v in np.asarray(soc.value)[:horizon_slots]
+        ]
     # Recover the chosen start slot from each pending cycle's binary vector.
     chosen_starts: dict[str, int] = {}
     for pc, s_a, _z in pending_data:
@@ -740,13 +868,24 @@ def solve_receding_horizon(
         [f"{v:.2f}" for v in sched.heater_power_kw[: min(8, horizon_slots)]],
     )
 
+    # expected_cost = objective − slack_penalty_term − terminal_reward_term
+    #               + committed_cost + base_load_cost
+    # The terminal reward is a negative term in the minimisation objective; we subtract it
+    # back out so expected_cost reflects real net grid expenditure (not negative energy profit).
+    # Base-Load cost is added here and to baseline_cost so the savings ratio measures money
+    # off the *total* bill — the only thing a Home Battery exists to reduce (ADR 0003).
+    terminal_reward_val = 0.0
+    if battery_spec is not None and soc is not None:
+        terminal_reward_val = -lambda_val * float(soc.value[horizon_slots])
+    base_load_cost = float((_base_load * prices).sum() * _PER_SLOT_FACTOR)
     sched.expected_cost = float(prob.value - _SLACK_PENALTY * (
         float(slack_ev.value or 0.0) + sum(float(s.value or 0.0) for s in slack_heat.values())
-    ) + committed_cost)
+    ) - terminal_reward_val + committed_cost + base_load_cost)
     sched.baseline_cost = _baseline_cost(
         prices, remaining_ev_kwh, remaining_heater_kwh_by_window,
         ev_mask, heater_masks, ev_spec.rated_kw, heater_spec.rated_kw,
         committed_list, appliances, horizon_slots, pending_list,
+        base_load=_base_load,
     )
     logger.info(
         "solve_receding_horizon: expected_cost=%.4f baseline_cost=%.4f "
@@ -818,6 +957,7 @@ def _baseline_cost(
     appliances: dict,
     horizon_slots: int,
     pending_cycles: Iterable[PendingCycle] | None = None,
+    base_load: np.ndarray | None = None,
 ) -> float:
     """Compute a price-unaware reference cost for the same horizon.
 
@@ -836,6 +976,10 @@ def _baseline_cost(
       onset), matching the unoptimised fallback and aligning with the
       pending-cycle energy already carried by ``expected_cost`` via
       ``prob.value``.
+    * **Base Load** — always-on inflexible demand. Added to both
+      ``baseline_cost`` and ``expected_cost`` so the savings ratio measures
+      money off the *total* bill (ADR 0003). When ``None`` or all-zeros the
+      term is zero and behaviour is unchanged (regression-clean).
 
     The optimiser's ``expected_cost`` is then compared to this baseline to
     produce the "savings" ratio reported in the schedule and used as the
@@ -854,6 +998,8 @@ def _baseline_cost(
         start = int(pc.earliest_start_slot)
         for t in range(start, min(start + pc.cycle_slots, horizon_slots)):
             cost += float(pc.rated_kw) * float(prices[t]) * _PER_SLOT_FACTOR
+    if base_load is not None:
+        cost += float((base_load * prices).sum() * _PER_SLOT_FACTOR)
     return cost
 
 
