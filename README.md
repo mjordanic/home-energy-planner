@@ -1,5 +1,13 @@
 # AeroGrid — Streaming Home Energy Optimiser (Demo)
 
+AeroGrid is a simulation of a house with an EV, a hot-water heater, a dishwasher, a washing machine and an optional home battery. It decides when each flexible load should run so that most electricity is bought in the cheapest hours, and compares that plan with simply switching everything on straight away. It is written for developers and researchers interested in home energy management; it does not control real devices.
+
+**Headline result (simulation, 48 h on real German prices from 3 Apr 2026, stored in `notebooks/06_end_to_end.ipynb`):** shifting loads cut the electricity cost by 29 % versus "switch on straight away" (€6.83 vs €9.61); adding a 13.5 kWh home battery cut it by 47 % (€5.10).
+
+**Scope:** solar panels are not modelled, and the only price data used is the German/Luxembourg day-ahead market (SMARD DE-LU). The savings only apply to a tariff whose price changes during the day.
+
+**Live replay:** <https://lamis-technologies.hr/projects/aerogrid/>
+
 > **This is a research demo, not production software.**  
 > It shows one end-to-end approach: real market prices → LP/MIP optimiser → LangGraph agent → human-in-the-loop HITL. Every component works, but most have known gaps listed at the bottom of this file.
 
@@ -122,11 +130,11 @@ Three notebooks in `notebooks/` walk through the system from data to full end-to
 
 | notebook | what it shows |
 |---|---|
-| `03_price_oracle.ipynb` | SMARD price EDA, seasonal-naive vs Chronos oracle comparison |
-| `05_optimizer.ipynb` | 13 LP/MIP scenarios (EV gate, deadline regimes, heater windows, power-cap coupling, HITL stress test, horizon sensitivity, joint MIP vs naive reschedule) |
-| `06_end_to_end.ipynb` | Full streaming simulation — baseline vs optimizer side by side, cumulative cost chart, per-appliance power breakdown, event log |
+| `03_price_oracle.ipynb` | SMARD price EDA and price-forecast (oracle) comparison. Chronos and GridFM need `uv sync --extra forecast`; without it every oracle falls back to seasonal-naive and the comparison shows identical numbers |
+| `05_optimizer.ipynb` | 16 LP/MIP scenarios (EV gate, deadline regimes, heater windows, power-cap coupling, HITL stress test, horizon sensitivity, joint MIP vs naive reschedule) |
+| `06_end_to_end.ipynb` | Full streaming simulation — baseline vs optimizer side by side, cumulative cost chart, per-appliance power breakdown, event log. Renders the logs of the last simulation in `data/cache/`; run at least `--hours 24` first (the stored outputs come from `--hours 48`). After the 8 h smoke run the battery strategy costs more than the no-battery one, so its cost-ordering checks fail |
 
-Run them with:
+The notebooks are stored with their outputs, so you can read them on GitHub without installing anything. Run them with:
 
 ```bash
 uv run jupyter lab notebooks/
@@ -136,9 +144,12 @@ uv run jupyter lab notebooks/
 
 ## Quickstart
 
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/). It downloads the Python version in `.python-version` (3.12) by itself, so pyenv is optional.
+
 ```bash
-# 1. Python — pyenv reads .python-version (3.12.13)
-pyenv install
+# 1. Get the code
+git clone https://github.com/mjordanic/home-energy-planner.git
+cd home-energy-planner
 
 # 2. Dependencies
 uv sync --extra dev
@@ -149,12 +160,13 @@ uv run python scripts/fetch_smard_prices.py
 # 4. Tests
 uv run pytest -q
 
-# 5. Full 16-day streaming simulation (three strategies: baseline, optimizer_nobatt, optimizer_batt)
-uv run python -m aerogrid.sim.digital_twin
-
-# Shorter smoke runs
-uv run python -m aerogrid.sim.digital_twin --hours 24
+# 5. Short smoke run (~20 s; three strategies: baseline, optimizer_nobatt, optimizer_batt)
 uv run python -m aerogrid.sim.digital_twin --hours 8 --horizon-hours 6 --no-log-file
+
+# Longer runs: 24 h takes ~5 min; the full 16-day default takes well over an hour
+# and prints only a final summary (progress goes to the log file in data/cache/)
+uv run python -m aerogrid.sim.digital_twin --hours 24
+uv run python -m aerogrid.sim.digital_twin
 
 # Optional: Chronos price oracle (requires torch)
 uv sync --extra forecast
@@ -168,6 +180,7 @@ Outputs land in `data/cache/`:
 | `slot_log.parquet` | 15 min | one row per slot; `<strategy>_*` columns per strategy |
 | `event_log.parquet` | 1 s | one row per decision; uniform schema across strategies |
 | `run_log.jsonl` | per replan | full OptimizerStrategy plan detail |
+| `aerogrid_<timestamp>.log` | — | text log of the run; skipped with `--no-log-file` |
 
 ### Slot-log columns (per strategy prefix)
 
@@ -182,7 +195,10 @@ Each strategy contributes a block of `<prefix>_*` columns to `slot_log.parquet`.
 | `<prefix>_battery_discharge_kw` | float | Home Battery discharge power (kW); 0 for non-battery strategies |
 | `<prefix>_soc_kwh` | float | Home Battery state of charge at slot start (kWh); 0 for non-battery strategies |
 | `<prefix>_net_grid_kw` | float | Net grid import: gross load + charge − discharge; equals total load when no battery |
-| `<prefix>_cumulative_cost` | float | Running cost accrued on `net_grid_kw` (not on gross load) |
+| `<prefix>_slot_cost_eur` | float | Cost of this slot (EUR), on `net_grid_kw` |
+| `<prefix>_cum_cost_eur` | float | Running cost accrued on `net_grid_kw` (not on gross load) |
+
+Other per-strategy columns: `_cycle_kw`, `_total_kw`, `_remaining_ev_kwh`, `_active_cycles`, and for optimizer strategies `_trigger_kind`, `_solver_status`, `_expected_cost_eur`, `_n_replans_total`.
 
 ### Schedule fields (in `run_log.jsonl`)
 
@@ -197,7 +213,7 @@ Each strategy contributes a block of `<prefix>_*` columns to `slot_log.parquet`.
 | `soc_kwh` | Per-slot Home Battery SoC at slot start over the horizon (kWh); empty list when no battery |
 | `expected_cost` | Forecast net-grid cost of this plan (from price forecast, not realized prices) |
 | `baseline_cost` | Forecast cost of the ASAP naive baseline (same forecast), for savings comparison |
-| `solver_status` | HiGHS / ECOS / SCIPY / fallback status string |
+| `solver_status` | CVXPY solve status (e.g. `optimal`), or `fallback:<status>` when the ASAP fallback plan was used |
 
 ---
 
@@ -207,7 +223,7 @@ Each strategy contributes a block of `<prefix>_*` columns to `slot_log.parquet`.
 - **Cross-strategy onset gating.** An onset is suppressed if *any* strategy still has the same appliance running, preventing a phantom second cycle in the comparison when strategies disagree on timing.
 - **Event-driven triggers.** Replans fire on state changes, not on a fixed clock — with a 30 s cooldown. The periodic 15-min resync is a safety net, not the primary trigger.
 - **Soft slacks.** EV and heater energy constraints are soft (penalty = 1000 × slack). The LP never goes infeasible; missed energy shows up as a non-zero slack in the solution.
-- **Forecast vs realized costs.** `Schedule.expected_cost` and `baseline_cost` are both computed from the *price forecast*, not realized prices. They compare two hypothetical plans. Realized cost is accumulated slot-by-slot in `cumulative_cost` (notebook 06) using only loads that physically ran.
+- **Forecast vs realized costs.** `Schedule.expected_cost` and `baseline_cost` are both computed from the *price forecast*, not realized prices. They compare two hypothetical plans. Realized cost is accumulated slot-by-slot in the `<prefix>_cum_cost_eur` slot-log column (notebook 06) using only loads that physically ran.
 
 ---
 
@@ -224,7 +240,8 @@ aerogrid/
                        forecast_price → optimize → propose_reschedule
                                       → hitl_gate → commit_plan
   optimizer.py       receding-horizon LP/MIP (HiGHS via CVXPY)
-  price_oracle.py    SeasonalNaive (default) / Chronos (optional)
+  price_oracle.py    SeasonalNaive (default) / Chronos, GridFM (optional,
+                     need --extra forecast)
   triggers.py        TriggerManager (new_onset / price_surprise /
                      deadline_slip / periodic + cooldown)
   commit.py          CommitTracker — remaining EV/heater kWh,
@@ -242,10 +259,15 @@ scripts/             one-shot data jobs
   fetch_smard_prices.py    SMARD DE-LU, no key, hard-fails on error
   fetch_entsoe_prices.py   ENTSO-E alt fetcher (requires ENTSOE_API_KEY, data not included)
   _gen_readme_images.py    regenerate docs/ images
+  _build_optimizer_notebook.py  regenerate notebooks/05_optimizer.ipynb
 
 notebooks/           EDA + demos (03 price oracle, 05 optimizer, 06 e2e)
 tests/               pytest suite
-docs/                static images for this README
+docs/                images for this README; docs/adr/ design decisions;
+                     docs/agents/ notes for AI coding agents
+CONTEXT.md           domain glossary
+AGENTS.md, CLAUDE.md instructions for AI coding agents (.agents/, .claude/
+                     hold the agent skills they reference)
 ```
 
 ---
@@ -275,7 +297,7 @@ This is a demo. The following are real gaps worth addressing before any producti
 
 **Appliance model**
 - Cycle shapes are rectangular: dishwasher always runs at exactly 2.5 kW for 2 h. Real appliances have variable power profiles (wash / heat / spin).
-- Only two cycle appliances are modelled. No dryer, air conditioning, water heater (resistive), EV with V2G.
+- Only two cycle appliances are modelled. No dryer, air conditioning or EV with V2G.
 - The EV is a single fixed-need daily demand (24 kWh). No state-of-charge model, no V2H/V2G, no variable departure time.
 
 **Onset detection**
@@ -290,5 +312,11 @@ This is a demo. The following are real gaps worth addressing before any producti
 - No solar PV, no grid export. Battery discharge only offsets household load; export to the grid is excluded by the no-export constraint (C5).
 
 **Engineering gaps**
-- The `OptimizerStrategy` re-solves the full LP/MIP on every trigger. With a longer horizon or many pending cycles this becomes slow (a 48 h run takes ~6 min wall time on a laptop).
+- The `OptimizerStrategy` re-solves the full LP/MIP on every trigger. With a longer horizon or many pending cycles this becomes slow (on a laptop an 8 h run takes ~20 s, a 24 h run ~5 min, and the full 16-day run well over an hour).
 - The HITL `interrupt()` path works in simulation with `auto_confirm=True` but has not been tested with a real human-in-the-loop UI.
+
+---
+
+## Licence and author
+
+MIT — see [LICENSE](LICENSE). Made by Mislav Jordanic.

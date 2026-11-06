@@ -55,7 +55,6 @@ def _default_prices_parquet() -> Path:
 _FETCH_HINT = {
     "smard": "fetch_smard_prices.py",
     "entsoe": "fetch_entsoe_prices.py",
-    "nyiso": "fetch_nyiso_prices.py",
 }
 
 
