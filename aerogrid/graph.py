@@ -413,6 +413,15 @@ def build_graph(
                 committed_tasks=committed,
                 pending_cycles=[pinned_now, *other_pending],
                 horizon_slots=horizon_slots,
+                # Same Base Load and battery inputs as n_optimize, so
+                # cost_now and cost_proposed are like for like and the
+                # decline plan is a real plan.
+                base_load_kw=np.asarray(
+                    get_base_load_kw(state["now"], n_slots=horizon_slots),
+                    dtype=float,
+                ),
+                battery_spec=state.get("battery_spec"),
+                initial_soc_kwh=float(state.get("soc_kwh") or 0.0),
             )
         except Exception as e:                       # noqa: BLE001
             logger.warning(
