@@ -175,3 +175,23 @@ def test_no_battery_real_saving_reaches_approval_question(fake_prices):
     payload = first["__interrupt__"][0].value
     assert payload["reschedule"]["appliance"] == "dishwasher"
     assert payload["reschedule"]["savings_eur"] == pytest.approx(0.15, abs=0.02)
+
+
+def test_pending_cycle_window_is_measured_from_the_original_onset():
+    from aerogrid.graph import _pending_cycles_from_onsets
+
+    onset = datetime(2024, 11, 20, 17, 30, tzinfo=timezone.utc)
+    (fresh,) = _pending_cycles_from_onsets(
+        [ApplianceOnset("dishwasher", onset, 1.0)], set(), 96, now=onset,
+    )
+    assert fresh.latest_start_slot == 8                 # full 2 h window
+    (re_offered,) = _pending_cycles_from_onsets(
+        [ApplianceOnset("dishwasher", onset, 1.0)], set(), 96,
+        now=onset + timedelta(hours=1, minutes=30),
+    )
+    assert re_offered.latest_start_slot == 2            # only 30 min left
+    (expired,) = _pending_cycles_from_onsets(
+        [ApplianceOnset("dishwasher", onset, 1.0)], set(), 96,
+        now=onset + timedelta(hours=3),
+    )
+    assert expired.latest_start_slot == 0               # window over → run now

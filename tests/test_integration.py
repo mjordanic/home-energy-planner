@@ -206,3 +206,59 @@ def test_three_strategies_battery_columns_and_cost_ordering(tmp_path: Path):
         f"nobatt={last['optimizer_nobatt_cum_cost_eur']:.4f} > "
         f"baseline={last['baseline_cum_cost_eur']:.4f}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Accepted (deferred) cycle stays inside its original shift window            #
+# --------------------------------------------------------------------------- #
+class _FallingEveningFeed:
+    """Price falls steadily from 17:00 to 03:00 every day, so every replan
+    after a 17:30 onset would like to push the dishwasher later still."""
+
+    def __init__(self, start: datetime, end: datetime):
+        idx = pd.date_range(start - timedelta(days=28), end, freq="15min", tz="UTC")
+        hod = idx.hour + idx.minute / 60.0
+        d = (hod - 17) % 24
+        lbmp = np.where(d <= 10, 200 - 15 * d, 50 + (d - 10) * 150 / 14)
+        self.df = pd.DataFrame({"timestamp": idx, "lbmp": lbmp.astype(np.float32)})
+
+    def history(self, now):
+        return self.df[self.df["timestamp"] < now]
+
+
+def test_accepted_cycle_runs_within_its_original_window_across_replans():
+    from aerogrid.config import HITL_RESCHEDULE_WINDOW_HOURS
+    from aerogrid.types import ApplianceOnset, Sample
+
+    onset_at = datetime(2024, 12, 16, 17, 30, tzinfo=timezone.utc)
+    end = onset_at + timedelta(hours=10)
+    feed = _FallingEveningFeed(onset_at, end)
+    opt = OptimizerStrategy(
+        price_history_provider=feed.history,
+        price_oracle_impl="naive",
+        auto_responses={"dishwasher": "accept"},
+    )
+
+    step = timedelta(minutes=5)
+    t = onset_at
+    running_at: list[datetime] = []
+    events: list[dict] = []
+    while t < end:
+        onsets = [ApplianceOnset("dishwasher", t, 1.0)] if t == onset_at else []
+        opt.tick(Sample(t=t), onsets, dt_s=step.total_seconds())
+        if any(task.appliance == "dishwasher" for task in opt.commit.running_committed_tasks(t)):
+            running_at.append(t)
+        events += opt.flush_events()
+        t += step
+
+    assert opt.n_reschedule_accept == 1
+    assert opt.n_replans >= 10, "the test needs many replans to be meaningful"
+    # The cycle ran, once, for its full length ...
+    assert running_at, "accepted dishwasher cycle never ran"
+    assert running_at[-1] - running_at[0] == timedelta(minutes=2 * 60) - step
+    # ... and started no later than the end of its ORIGINAL window.
+    assert running_at[0] <= onset_at + timedelta(hours=HITL_RESCHEDULE_WINDOW_HOURS)
+    # Re-solving a deferred cycle at an unchanged start is not a new commit.
+    commits = [e for e in events
+               if e["event_type"] == "cycle_committed" and e["appliance"] == "dishwasher"]
+    assert len(commits) <= 3, f"{len(commits)} cycle_committed events for one cycle"

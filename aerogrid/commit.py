@@ -68,6 +68,9 @@ class CommitTracker:
     last_heater_deadline_reset: dict[int, datetime] = field(default_factory=dict)
     _task_start_times: dict[str, datetime] = field(default_factory=dict)
     _task_end_times: dict[str, datetime] = field(default_factory=dict)
+    # When each cycle was first committed (the user's onset); a deferred
+    # cycle's shift window is measured from here, not from each replan.
+    _task_onset_times: dict[str, datetime] = field(default_factory=dict)
     # Track which heater window the current ``now`` lives in, so the heater
     # setpoint is debited from the right window.
     _heater_deadlines: tuple[HeaterEnergyDeadline, ...] = HEATER_DEADLINES
@@ -227,6 +230,7 @@ class CommitTracker:
             else:
                 self._task_start_times.pop(task.appliance, None)
                 self._task_end_times.pop(task.appliance, None)
+                self._task_onset_times.pop(task.appliance, None)
                 logger.info(
                     "CommitTracker: task retired appliance=%s cycle_end=%s",
                     task.appliance, end.isoformat() if end else "None",
@@ -295,7 +299,7 @@ class CommitTracker:
         start_at: datetime,
         *,
         now: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         """Pin an event-driven cycle (dishwasher / washing machine) starting at ``start_at``.
 
         Used by the HITL reschedule path: after the user accepts a small
@@ -304,9 +308,14 @@ class CommitTracker:
         exogenous load on the cap until it ends. ``start_at`` may be in
         the future (a deferred start) or equal to ``now`` (run immediately,
         the "decline" case is also handled this way).
+
+        Returns ``True`` when the cycle was newly committed or its start
+        moved, ``False`` when nothing changed.
         """
         if appliance in {t.appliance for t in self.committed_tasks}:
             old_start = self._task_start_times.get(appliance)
+            if old_start == start_at:
+                return False
             if old_start is not None and now is not None and now < old_start:
                 self._task_start_times[appliance] = start_at
                 self._task_end_times[appliance] = start_at + timedelta(
@@ -318,13 +327,15 @@ class CommitTracker:
                     start_at.isoformat(),
                     self._task_end_times[appliance].isoformat(),
                 )
-            else:
-                logger.debug(
-                    "CommitTracker.adopt_cycle_start: already committed and started: %s",
-                    appliance,
-                )
-            return
+                return True
+            logger.debug(
+                "CommitTracker.adopt_cycle_start: already committed and started: %s",
+                appliance,
+            )
+            return False
         self._commit_task(appliance, slots, expected_kwh, start_at)
+        self._task_onset_times[appliance] = now if now is not None else start_at
+        return True
 
     def _commit_task(
         self,
@@ -363,7 +374,11 @@ class CommitTracker:
         return out
 
     def replannable_onsets(self, now: datetime) -> list[ApplianceOnset]:
-        """Expose deferred (not-yet-started) cycles as synthetic onsets."""
+        """Expose deferred (not-yet-started) cycles as synthetic onsets.
+
+        Each onset carries the cycle's *original* onset time, so a replan
+        can only move the cycle within its original shift window.
+        """
         out: list[ApplianceOnset] = []
         for task in self.committed_tasks:
             s = self._task_start_times.get(task.appliance)
@@ -374,7 +389,7 @@ class CommitTracker:
                 out.append(
                     ApplianceOnset(
                         appliance=task.appliance,
-                        timestamp=now,
+                        timestamp=self._task_onset_times.get(task.appliance, now),
                         confidence=1.0,
                         source="injected",
                     )

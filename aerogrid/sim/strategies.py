@@ -838,10 +838,12 @@ class OptimizerStrategy(Strategy):
                 continue
             cycle_kwh = spec.rated_kw * spec.cycle_slots * (SLOT_MINUTES / 60.0)
             start_at = now + timedelta(minutes=SLOT_MINUTES * int(slot))
-            self.commit.adopt_cycle_start(
+            changed = self.commit.adopt_cycle_start(
                 appliance=appliance, slots=spec.cycle_slots,
                 expected_kwh=cycle_kwh, start_at=start_at, now=now,
             )
+            if not changed:
+                continue
             self._emit(
                 now, "cycle_committed",
                 appliance=appliance, power_kw=spec.rated_kw,
