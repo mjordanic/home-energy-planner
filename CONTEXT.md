@@ -43,9 +43,8 @@ _Avoid_: Net load, grid power, consumption (gross load is different).
 
 **Value of Stored Energy**:
 The worth the optimizer assigns to energy still in the battery at the end of
-the receding horizon, so it neither hoards nor dumps energy at the horizon
-edge. Priced at the cheapest energy it could have been bought for, never
-below zero.
+the receding horizon. Zero: the objective carries no terminal value, because
+an earlier minimum-price reward changed no executed slot (ADR 0002).
 _Avoid_: Terminal value, salvage value, end-of-horizon bonus.
 
 **Savings**:
