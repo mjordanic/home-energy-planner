@@ -10,9 +10,14 @@ of a handful of conditions is met:
                         dishwasher / washing machine.
 2. ``price_surprise`` — realized 15-min LBMP deviates from forecast by more
                         than ``REPLAN_PRICE_DEVIATION`` (relative).
-3. ``deadline_slip``  — the EV's current charge rate cannot meet the daily
-                        kWh target by 07:00 at the configured safety margin.
-                        The "rate required" denominator uses only the
+3. ``deadline_slip``  — the EV is falling behind the plan it is executing
+                        (``ev_behind_plan_kwh``, see
+                        :func:`planned_ev_kwh_before_deadline`). A plan that
+                        deliberately defers charging to cheap night slots is
+                        not a slip. Without a plan the check falls back to
+                        "the current charge rate cannot meet the daily kWh
+                        target by 07:00 at the configured safety margin",
+                        where the "rate required" denominator uses only the
                         *available charging window* (between
                         ``EV_AVAILABLE_FROM_HOUR`` and the deadline), not
                         the full time-to-deadline — otherwise we would
@@ -35,11 +40,19 @@ from aerogrid.config import (
     EV_AVAILABLE_FROM_HOUR,
     EV_DEADLINE_HOUR,
     REPLAN_PRICE_DEVIATION,
+    SLOT_MINUTES,
     TRIGGER_COOLDOWN_S,
     TRIGGER_DEADLINE_SAFETY,
     TRIGGER_RESYNC_MINUTES,
 )
-from aerogrid.types import ApplianceOnset, PriceForecast, ReplanTrigger, Sample, ScheduledTask
+from aerogrid.types import (
+    ApplianceOnset,
+    PriceForecast,
+    ReplanTrigger,
+    Sample,
+    Schedule,
+    ScheduledTask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +147,31 @@ def ev_charging_window_hours(
     return hours
 
 
+def planned_ev_kwh_before_deadline(
+    plan: Schedule,
+    now: datetime,
+    deadline_hour: int = EV_DEADLINE_HOUR,
+) -> float:
+    """kWh ``plan`` still delivers to the EV between ``now`` and the next deadline.
+
+    The slot containing ``now`` counts only for the part not yet elapsed, so
+    a plan executed exactly as written keeps
+    ``remaining_ev_kwh − planned_ev_kwh_before_deadline(plan, now)`` constant.
+    """
+    slot_h = SLOT_MINUTES / 60.0
+    pos = (now - plan.slot_start).total_seconds() / (SLOT_MINUTES * 60.0)
+    deadline = now + timedelta(hours=time_to_deadline_hours(now, deadline_hour))
+    end = min(
+        len(plan.ev_power_kw),
+        int(round((deadline - plan.slot_start).total_seconds() / (SLOT_MINUTES * 60.0))),
+    )
+    k = int(pos)
+    if pos < 0 or k >= end:
+        return 0.0
+    kwh = plan.ev_power_kw[k] * (k + 1 - pos) * slot_h
+    return kwh + sum(plan.ev_power_kw[k + 1:end]) * slot_h
+
+
 def _is_ev_pluggable(
     now: datetime,
     deadline_hour: int = EV_DEADLINE_HOUR,
@@ -172,8 +210,15 @@ class TriggerManager:
         price_forecast: PriceForecast | None = None,
         remaining_ev_kwh: float = 0.0,
         ev_power_setpoint_kw: float = 0.0,
+        ev_behind_plan_kwh: float | None = None,
     ) -> ReplanTrigger | None:
-        """Return a trigger if one fires at ``now``, else ``None``."""
+        """Return a trigger if one fires at ``now``, else ``None``.
+
+        ``ev_behind_plan_kwh`` is how far the EV has fallen behind the plan
+        being executed (kWh). When supplied, the deadline-slip check fires
+        only on that drift; when ``None`` (no plan yet) it falls back to
+        comparing the current setpoint with the rate the deadline needs.
+        """
         logger.debug(
             "TriggerManager.evaluate: now=%s new_onsets=%d committed=%d "
             "ev_remaining=%.2fkWh ev_setpoint=%.2fkW",
@@ -239,7 +284,21 @@ class TriggerManager:
         # setpoint is correct, not a slip.
         window_h = ev_charging_window_hours(now)
         ev_pluggable_now = _is_ev_pluggable(now)
-        if remaining_ev_kwh > 0.1 and window_h > 0.05 and ev_pluggable_now:
+        if (
+            ev_behind_plan_kwh is not None
+            and remaining_ev_kwh > 0.1 and window_h > 0.05 and ev_pluggable_now
+        ):
+            # A plan that defers charging to later, cheaper slots is not a
+            # slip: firing on the current setpoint would re-plan every
+            # cooldown all evening. Only drift from the plan counts.
+            if ev_behind_plan_kwh > 0.1:
+                detail = (
+                    f"{ev_behind_plan_kwh:.2f}kWh behind plan, "
+                    f"{remaining_ev_kwh:.1f}kWh / {window_h:.1f}h available"
+                )
+                logger.info("TriggerManager FIRED deadline_slip: %s at=%s", detail, now.isoformat())
+                return ReplanTrigger(kind="deadline_slip", detail=detail, at=now)
+        elif remaining_ev_kwh > 0.1 and window_h > 0.05 and ev_pluggable_now:
             required_rate = remaining_ev_kwh / window_h
             effective_rate = max(ev_power_setpoint_kw, 0.1) * self.deadline_safety
             logger.debug(
@@ -281,4 +340,5 @@ __all__ = [
     "time_to_deadline_hours",
     "time_to_next_deadline",
     "ev_charging_window_hours",
+    "planned_ev_kwh_before_deadline",
 ]

@@ -10,6 +10,7 @@ from aerogrid.config import EV_AVAILABLE_FROM_HOUR, EV_DAILY_NEED_KWH, HEATER_DE
 from aerogrid.triggers import (
     TriggerManager,
     ev_charging_window_hours,
+    planned_ev_kwh_before_deadline,
     time_to_deadline_hours,
 )
 from aerogrid.types import (
@@ -140,6 +141,56 @@ def test_deadline_slip_not_fired_when_charging_fast_enough():
         ev_power_setpoint_kw=7.0,
     )
     assert out is None or out.kind != "deadline_slip"
+
+
+def _deferred_ev_plan(now: datetime) -> Schedule:
+    """Plan made at ``now`` (21:00): EV idle until 02:00, then 24 kWh by 06:00."""
+    ev = [0.0] * 96
+    ev[20:35] = [7.0] * 13 + [3.0, 2.0]      # slots 02:00 → 05:45
+    assert sum(ev) * 0.25 == pytest.approx(24.0)
+    return Schedule(slot_start=now, horizon_slots=96, ev_power_kw=ev)
+
+
+def test_planned_ev_kwh_counts_only_what_is_left_of_the_current_slot():
+    plan = Schedule(slot_start=NOW, horizon_slots=96, ev_power_kw=[4.0] * 96)
+    # 21:05: 10 min of slot 0 left, then 21:15 → 07:00 = 39 slots.
+    got = planned_ev_kwh_before_deadline(plan, NOW + timedelta(minutes=5))
+    assert got == pytest.approx(4.0 * (10 / 60) + 4.0 * 0.25 * 39)
+
+
+def test_deadline_slip_not_fired_when_plan_defers_charging():
+    """The plan charges later at night, so a 0 kW setpoint at 21:00 is the
+    plan, not a slip. The old rate check fired here every cooldown."""
+    plan = _deferred_ev_plan(NOW)
+    remaining = 24.0
+    gap = remaining - planned_ev_kwh_before_deadline(plan, NOW)
+    tm = TriggerManager()
+    tm.notify_replanned(NOW)
+    later = NOW + timedelta(minutes=5)
+    behind = remaining - planned_ev_kwh_before_deadline(plan, later) - gap
+    out = tm.evaluate(
+        now=later, remaining_ev_kwh=remaining, ev_power_setpoint_kw=0.0,
+        ev_behind_plan_kwh=behind,
+    )
+    assert behind == pytest.approx(0.0)
+    assert out is None
+
+
+def test_deadline_slip_fires_when_ev_falls_behind_plan():
+    """At 02:01 the plan has charged for a minute but the EV is still at 0 kW."""
+    plan = _deferred_ev_plan(NOW)
+    remaining = 24.0
+    gap = remaining - planned_ev_kwh_before_deadline(plan, NOW)
+    tm = TriggerManager()
+    later = NOW + timedelta(hours=5, minutes=1)
+    tm.notify_replanned(later - timedelta(minutes=10))
+    behind = remaining - planned_ev_kwh_before_deadline(plan, later) - gap
+    out = tm.evaluate(
+        now=later, remaining_ev_kwh=remaining, ev_power_setpoint_kw=0.0,
+        ev_behind_plan_kwh=behind,
+    )
+    assert behind == pytest.approx(7.0 / 60)
+    assert out is not None and out.kind == "deadline_slip"
 
 
 def test_periodic_fires_after_resync_minutes():

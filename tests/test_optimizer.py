@@ -837,3 +837,154 @@ def test_expected_cost_le_baseline_cost_with_base_load():
     assert sched.expected_cost <= sched.baseline_cost + 1e-6, (
         f"expected_cost={sched.expected_cost:.4f} > baseline_cost={sched.baseline_cost:.4f}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Battery: no simultaneous charge/discharge, terminal reward floor             #
+# --------------------------------------------------------------------------- #
+_NO_HEAT = {7: 0.0, 18: 0.0}
+
+
+@pytest.mark.parametrize("profile", ["negative_slots", "zero_floor"])
+def test_battery_never_charges_and_discharges_in_same_slot(profile):
+    """Same-slot charge + discharge only wastes energy; the plan must not do it.
+
+    ``negative_slots``: a nearly full pack before and during negative prices,
+    where the round-trip loss pays (it raises paid import and makes room).
+    ``zero_floor``: the cheapest price is 0, so λ = 0 and stored energy is
+    worth nothing — the waste is a tie the LP used to take.
+    """
+    now = datetime(2026, 3, 12, 6, 0, tzinfo=timezone.utc)
+    if profile == "negative_slots":
+        prices = np.full(H_DAY, 60.0)
+        prices[16:40] = -10.0
+        soc0 = 12.0
+    else:
+        prices = np.full(H_DAY, 80.0)
+        prices[::7] = 0.0
+        soc0 = 6.0
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window=_NO_HEAT,
+        base_load_kw=np.full(H_DAY, 0.3), battery_spec=_batt(), initial_soc_kwh=soc0,
+    )
+    both = np.minimum(sched.battery_charge_kw, sched.battery_discharge_kw)
+    assert both.max() <= 1e-6, f"charge and discharge together in slots {np.where(both > 1e-6)[0]}"
+
+
+def test_battery_terminal_reward_never_penalises_stored_energy():
+    """With a negative cheapest price, λ is floored at 0, so the plan does not
+    dump the pack into load bought at a negative price just to end emptier."""
+    now = datetime(2026, 3, 12, 6, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, -1.0)
+    prices[:4] = -20.0
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window=_NO_HEAT,
+        base_load_kw=np.full(H_DAY, 0.5), battery_spec=_batt(), initial_soc_kwh=10.0,
+    )
+    assert sum(sched.battery_discharge_kw) <= 1e-6
+
+
+def test_battery_throughput_cost_not_in_expected_cost():
+    """The throughput cost steers the LP but is not money: expected_cost is the
+    forecast bill of the plan."""
+    now = datetime(2026, 3, 12, 6, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, 60.0)
+    prices[16:40] = -10.0
+    base = np.full(H_DAY, 0.3)
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0, remaining_heater_kwh_by_window=_NO_HEAT,
+        base_load_kw=base, battery_spec=_batt(), initial_soc_kwh=2.0,
+    )
+    net = (
+        base + np.asarray(sched.ev_power_kw) + np.asarray(sched.heater_power_kw)
+        + np.asarray(sched.battery_charge_kw) - np.asarray(sched.battery_discharge_kw)
+    )
+    bill = float((net * prices).sum() * 0.25 / 1000.0)
+    assert sched.expected_cost == pytest.approx(bill, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# EV / heater physical upper energy limits                                    #
+# --------------------------------------------------------------------------- #
+def test_ev_takes_no_more_than_it_needs_at_negative_prices():
+    now = datetime(2026, 4, 4, 7, 15, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, -20.0)
+    sched = solve_receding_horizon(now, prices, remaining_ev_kwh=24.0)
+    assert sum(sched.ev_power_kw) * 0.25 == pytest.approx(24.0, abs=1e-4)
+
+
+def test_ev_draws_nothing_once_full_at_negative_prices():
+    now = datetime(2026, 4, 4, 22, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, -20.0)
+    sched = solve_receding_horizon(now, prices, remaining_ev_kwh=0.0)
+    before_deadline = 9 * 4                      # 22:00 → 07:00
+    assert sum(sched.ev_power_kw[:before_deadline]) <= 1e-6
+    # The next night's window starts a fresh daily need, at most.
+    assert sum(sched.ev_power_kw[before_deadline:]) * 0.25 <= EV_DAILY_NEED_KWH + 1e-4
+
+
+def test_heater_takes_no_more_than_each_window_needs_at_negative_prices():
+    now = datetime(2026, 4, 4, 10, 0, tzinfo=timezone.utc)
+    prices = np.full(H_DAY, -20.0)
+    sched = solve_receding_horizon(
+        now, prices, remaining_ev_kwh=0.0,
+        remaining_heater_kwh_by_window={7: 4.0, 18: 0.5},
+    )
+    heat_kwh = np.asarray(sched.heater_power_kw) * 0.25
+    # 10:00 → 18:00 owes 0.5 kWh, 18:00 → 07:00 owes 4, 07:00 → 10:00 (next
+    # day's daytime window) at most its full 2 kWh.
+    assert heat_kwh[:32].sum() == pytest.approx(0.5, abs=1e-4)
+    assert heat_kwh[32:84].sum() == pytest.approx(4.0, abs=1e-4)
+    assert heat_kwh[84:].sum() <= 2.0 + 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# Solver chain and fallback                                                   #
+# --------------------------------------------------------------------------- #
+def _fail_solver(monkeypatch, failing: set[str], *, raise_error: bool):
+    """Make the solvers in ``failing`` raise or report ``infeasible``; log every call."""
+    import cvxpy as cp
+    calls: list[str] = []
+    real_solve = cp.Problem.solve
+
+    def solve(self, *args, solver=None, **kwargs):
+        calls.append(solver)
+        if solver in failing:
+            if raise_error:
+                raise cp.SolverError(f"{solver} broken")
+            real_solve(self, *args, solver=solver, **kwargs)
+            self._status, self._value = "infeasible", None
+            return None
+        return real_solve(self, *args, solver=solver, **kwargs)
+
+    monkeypatch.setattr(cp.Problem, "solve", solve)
+    return calls
+
+
+def test_solver_chain_moves_on_after_non_optimal_status(monkeypatch):
+    calls = _fail_solver(monkeypatch, {"HIGHS"}, raise_error=False)
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    sched = solve_receding_horizon(now, _cheap_overnight(), remaining_ev_kwh=10.0)
+    assert calls[:2] == ["HIGHS", "ECOS"]
+    assert sched.solver_status == "optimal"
+
+
+def test_fallback_plan_respects_house_cap(monkeypatch):
+    _fail_solver(monkeypatch, {"HIGHS", "ECOS", "SCIPY", "GLPK_MI"}, raise_error=True)
+    now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    base = np.full(H_DAY, 0.75)
+    committed = [
+        ScheduledTask(appliance="dishwasher", start_slot=0, slots=8, expected_kwh=5.0, committed=True),
+    ]
+    sched = solve_receding_horizon(
+        now, _flat_prices(), remaining_ev_kwh=24.0, committed_tasks=committed,
+        pending_cycles=[_pc("washing_machine", latest_start=0)], base_load_kw=base,
+    )
+    assert sched.solver_status.startswith("fallback")
+    fixed = base.copy()
+    fixed[:8] += APPLIANCES["dishwasher"].rated_kw
+    fixed[:6] += APPLIANCES["washing_machine"].rated_kw
+    load = fixed + np.asarray(sched.ev_power_kw) + np.asarray(sched.heater_power_kw)
+    assert load.max() <= 10.0 + 1e-9
+    # The EV still charges ASAP with whatever headroom is left.
+    assert sched.ev_power_kw[0] == pytest.approx(10.0 - fixed[0])

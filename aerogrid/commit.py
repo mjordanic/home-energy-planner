@@ -87,6 +87,13 @@ class CommitTracker:
     # source of truth for "how much the battery actually delivered this slot".
     # Always ≤ battery_discharge_setpoint_kw; equals it when no throttle applies.
     battery_discharge_applied_kw: float = 0.0
+    # Applied power from the most recent tick for the EV, the heater and
+    # battery charging: the setpoint, cut back once the EV is full, the
+    # heater window is satisfied or the battery is full. What the strategy
+    # bills, so billed energy matches the counters and the SoC.
+    ev_power_applied_kw: float = 0.0
+    heater_power_applied_kw: float = 0.0
+    battery_charge_applied_kw: float = 0.0
 
     # ------------------------------------------------------------------ #
     def _active_heater_window(self, now: datetime) -> int | None:
@@ -128,9 +135,19 @@ class CommitTracker:
         net grid draw never goes negative (no phantom export). SoC drains by
         the *applied* amount, not the raw setpoint. When omitted the behaviour
         is unchanged — every existing caller and test is unaffected.
+
+        The ``*_applied_kw`` fields record what actually flowed this tick:
+        the EV and heater stop drawing once their remaining kWh reach zero,
+        and the battery stops charging when full and discharging when empty.
         """
+        self.ev_power_applied_kw = 0.0
+        # Without deadline windows there is no heater counter to cut back.
+        self.heater_power_applied_kw = (
+            0.0 if self._heater_deadlines else self.heater_power_setpoint_kw
+        )
         if self.ev_power_setpoint_kw > 0.0:
-            delivered = self.ev_power_setpoint_kw * dt_s / 3600.0
+            delivered = min(self.ev_power_setpoint_kw * dt_s / 3600.0, self.remaining_ev_kwh)
+            self.ev_power_applied_kw = delivered * 3600.0 / dt_s
             prev = self.remaining_ev_kwh
             self.remaining_ev_kwh = max(0.0, self.remaining_ev_kwh - delivered)
             logger.debug(
@@ -141,8 +158,9 @@ class CommitTracker:
         if self.heater_power_setpoint_kw > 0.0 and self._heater_deadlines:
             active_h = self._active_heater_window(now)
             if active_h is not None:
-                delivered = self.heater_power_setpoint_kw * dt_s / 3600.0
                 prev = self.remaining_heater_kwh_by_window.get(active_h, 0.0)
+                delivered = min(self.heater_power_setpoint_kw * dt_s / 3600.0, prev)
+                self.heater_power_applied_kw = delivered * 3600.0 / dt_s
                 new_val = max(0.0, prev - delivered)
                 self.remaining_heater_kwh_by_window[active_h] = new_val
                 logger.debug(
@@ -152,10 +170,22 @@ class CommitTracker:
                 )
 
         # Update Home Battery SoC from charge/discharge setpoints.
+        if offsettable_load_kw is not None:
+            # A full EV or a satisfied heater window draws nothing, so the
+            # battery cannot offset its setpoint.
+            offsettable_load_kw -= (
+                self.ev_power_setpoint_kw - self.ev_power_applied_kw
+                + self.heater_power_setpoint_kw - self.heater_power_applied_kw
+            )
+        self.battery_charge_applied_kw = 0.0
         if self.battery_spec is not None:
             bspec = self.battery_spec
             if self.battery_charge_setpoint_kw > 0.0:
-                energy_stored = bspec.eta_charge * self.battery_charge_setpoint_kw * dt_s / 3600.0
+                energy_stored = min(
+                    bspec.eta_charge * self.battery_charge_setpoint_kw * dt_s / 3600.0,
+                    max(0.0, bspec.capacity_kwh - self.soc_kwh),
+                )
+                self.battery_charge_applied_kw = energy_stored / bspec.eta_charge * 3600.0 / dt_s
                 self.soc_kwh = min(bspec.capacity_kwh, self.soc_kwh + energy_stored)
                 logger.debug(
                     "CommitTracker.tick: battery charge stored=%.4f kWh soc=%.3f kWh",
@@ -170,10 +200,14 @@ class CommitTracker:
                 if offsettable_load_kw is not None:
                     applied_dis_kw = min(
                         self.battery_discharge_setpoint_kw,
-                        max(0.0, offsettable_load_kw + self.battery_charge_setpoint_kw),
+                        max(0.0, offsettable_load_kw + self.battery_charge_applied_kw),
                     )
                 else:
                     applied_dis_kw = self.battery_discharge_setpoint_kw
+                # An empty battery delivers nothing.
+                applied_dis_kw = min(
+                    applied_dis_kw, self.soc_kwh * bspec.eta_discharge * 3600.0 / dt_s,
+                )
                 self.battery_discharge_applied_kw = applied_dis_kw
                 energy_released = applied_dis_kw * dt_s / 3600.0 / bspec.eta_discharge
                 self.soc_kwh = max(0.0, self.soc_kwh - energy_released)
@@ -407,6 +441,7 @@ class CommitTracker:
             "battery_charge_setpoint_kw": self.battery_charge_setpoint_kw,
             "battery_discharge_setpoint_kw": self.battery_discharge_setpoint_kw,
             "battery_discharge_applied_kw": self.battery_discharge_applied_kw,
+            "battery_charge_applied_kw": self.battery_charge_applied_kw,
         }
 
 
