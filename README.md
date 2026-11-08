@@ -113,15 +113,14 @@ The EV and heater energy targets (C2, C3) are enforced as **soft** constraints v
 **Objective** — what the optimizer minimizes:
 
 ```
-forecast net-grid cost  +  1000 × (energy slacks)  −  terminal reward  +  throughput cost
+forecast net-grid cost  +  1000 × (energy slacks)  +  throughput cost
 ```
 
 - **Forecast net-grid cost** is the electricity bill: each slot's net grid draw (in kWh) times that slot's forecast price, summed over the horizon. Shifting loads into cheap slots is what lowers this term.
 - **1000 × slack penalties** makes any C2/C3 energy shortfall expensive, so the optimizer only ever leaves a target unmet when the power cap physically forces it to — and even then, by the smallest possible amount.
-- **Terminal reward** *(battery only)* values energy still stored at the end of the horizon: `λ·soc[T]` with `λ = max(min(price), 0)/1000 × η_d`, never below zero. In re-runs on SMARD prices it changed none of the executed first slots, and closed-loop bills match to the cent without it (ADR 0002); it is kept as a guard, not as a mechanism that changes results.
-- **Throughput cost** *(battery only)* is a small cost per kWh charged or discharged, `ε[t] = k·max(0, −min future price)` with `k = (1 − η_c·η_d)/(2·η_c·η_d)` (≈ 0.054), plus a 0.01 €/MWh tie-break when `λ = 0`. It is zero whenever all prices are positive and only makes same-slot charge + discharge unprofitable. Like the slack and the terminal reward it is not part of the reported `expected_cost`.
+- **Throughput cost** *(battery only)* is a small cost per kWh charged or discharged, `ε[t] = 0.01 + k·max(0, −min future price)` €/MWh with `k = (1 − η_c·η_d)/(2·η_c·η_d)` (≈ 0.054). The 0.01 €/MWh tie-break applies in every slot; the `k` term is zero whenever all prices are positive. Together they only make same-slot charge + discharge (or cycling energy for no gain) unprofitable. Like the slack it is not part of the reported `expected_cost`. Energy left in the battery at the horizon end has no value in the objective: an earlier terminal reward for it changed none of the executed first slots in re-runs on SMARD prices, and was removed (ADR 0002).
 
-**Solver chain and fallback:** solvers are tried in order (HiGHS → ECOS → SciPy for the LP, HiGHS → GLPK_MI for the MIP); one that raises or returns a non-optimal status hands over to the next. If every solver fails, the function returns a deterministic ASAP plan (EV charges from first open slot, heater runs from start of each window, both cut back to stay under the house cap, cycles placed at `earliest_start_slot`, battery idles at 0 kW).
+**Solver chain and fallback:** the LP is tried with HiGHS, then CLARABEL (an independent interior-point solver); one that raises or returns a non-optimal status hands over to the next. HiGHS is the only installed MIP solver, so if it fails on the MIP, the optimizer fixes each combination of pending-cycle start slots in turn (9 or fewer per cycle at the default 2 h window), solves each as an LP with the same chain, and keeps the cheapest. If every solver fails, the function returns a deterministic ASAP plan (EV charges from first open slot, heater runs from start of each window, both cut back to stay under the house cap, cycles placed at `earliest_start_slot`, battery idles at 0 kW).
 
 ---
 

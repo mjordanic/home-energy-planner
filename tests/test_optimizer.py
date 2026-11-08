@@ -643,14 +643,12 @@ def test_battery_cycles_above_loss_threshold():
     assert dis.sum() > 0.1, "Battery should discharge with 10x price spread"
 
 
-def test_battery_terminal_reward_prevents_edge_dumping():
-    """Battery charges in cheap trough near horizon end: terminal reward makes it worthwhile.
+def test_battery_charges_in_trough_near_horizon_edge():
+    """Battery charges in a cheap trough near the horizon end, with no terminal value.
 
     Scenario: expensive slots 0..59, cheap trough at 60..79, expensive again 80..95.
-    The expensive tail (80..95) is the payoff window. Without terminal reward the
-    optimizer might not charge in 60..79 if the payoff within the horizon boundary
-    is uncertain. With the terminal reward, charging in 60..79 is always beneficial
-    because the leftover SoC is rewarded at λ = (min_price/1000) × η_d.
+    The expensive tail (80..95) is the payoff window inside the horizon, so
+    charging in 60..79 pays even though leftover SoC is worth nothing (ADR 0002).
 
     We verify: the battery charges in the cheap trough (sums to > 0).
     """
@@ -670,7 +668,7 @@ def test_battery_terminal_reward_prevents_edge_dumping():
     # Battery should charge in cheap trough and discharge in expensive slots after it.
     cheap_charge = chg[60:80].sum()
     assert cheap_charge > 0.0, (
-        "Battery should charge in cheap trough; terminal reward makes it worthwhile "
+        "Battery should charge in cheap trough to discharge in the expensive tail, "
         "even near the horizon edge"
     )
     assert (soc_arr >= -1e-4).all(), "SoC must not go negative"
@@ -840,7 +838,7 @@ def test_expected_cost_le_baseline_cost_with_base_load():
 
 
 # --------------------------------------------------------------------------- #
-# Battery: no simultaneous charge/discharge, terminal reward floor             #
+# Battery: no simultaneous charge/discharge, no dumping at negative prices    #
 # --------------------------------------------------------------------------- #
 _NO_HEAT = {7: 0.0, 18: 0.0}
 
@@ -851,8 +849,8 @@ def test_battery_never_charges_and_discharges_in_same_slot(profile):
 
     ``negative_slots``: a nearly full pack before and during negative prices,
     where the round-trip loss pays (it raises paid import and makes room).
-    ``zero_floor``: the cheapest price is 0, so λ = 0 and stored energy is
-    worth nothing — the waste is a tie the LP used to take.
+    ``zero_floor``: the cheapest price is 0, so wasting energy into a free
+    slot is a tie without the throughput tie-break.
     """
     now = datetime(2026, 3, 12, 6, 0, tzinfo=timezone.utc)
     if profile == "negative_slots":
@@ -871,9 +869,9 @@ def test_battery_never_charges_and_discharges_in_same_slot(profile):
     assert both.max() <= 1e-6, f"charge and discharge together in slots {np.where(both > 1e-6)[0]}"
 
 
-def test_battery_terminal_reward_never_penalises_stored_energy():
-    """With a negative cheapest price, λ is floored at 0, so the plan does not
-    dump the pack into load bought at a negative price just to end emptier."""
+def test_battery_does_not_dump_stored_energy_at_negative_prices():
+    """With every price negative, discharging only displaces import that pays,
+    so the plan does not dump the pack just to end emptier."""
     now = datetime(2026, 3, 12, 6, 0, tzinfo=timezone.utc)
     prices = np.full(H_DAY, -1.0)
     prices[:4] = -20.0
@@ -965,12 +963,60 @@ def test_solver_chain_moves_on_after_non_optimal_status(monkeypatch):
     calls = _fail_solver(monkeypatch, {"HIGHS"}, raise_error=False)
     now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
     sched = solve_receding_horizon(now, _cheap_overnight(), remaining_ev_kwh=10.0)
-    assert calls[:2] == ["HIGHS", "ECOS"]
+    assert calls[:2] == ["HIGHS", "CLARABEL"]
     assert sched.solver_status == "optimal"
 
 
+def test_lp_chain_lists_only_installed_solvers():
+    import cvxpy as cp
+    from aerogrid.optimizer import _LP_SOLVER_CHAIN, _MIP_SOLVER_CHAIN
+    assert set(_LP_SOLVER_CHAIN + _MIP_SOLVER_CHAIN) <= set(cp.installed_solvers())
+
+
+@pytest.mark.parametrize("cycles", [
+    ["dishwasher"],
+    ["dishwasher", "washing_machine"],
+])
+def test_mip_failure_is_solved_by_enumerating_start_choices(monkeypatch, cycles):
+    """When the MIP solver fails, fixing each start choice and solving the LPs
+    gives the same plan HiGHS's MIP finds."""
+    import cvxpy as cp
+    now = datetime(2026, 3, 12, 6, 0, tzinfo=timezone.utc)
+    # A single cheapest start for each cycle, so the optimum is unique.
+    t = np.arange(H_DAY)
+    prices = 100.0 + 2.0 * (t - 7.3) ** 2
+    pending = [_pc("dishwasher", latest_start=8), _pc("washing_machine", latest_start=2)]
+    pending = [pc for pc in pending if pc.appliance in cycles]
+    kwargs = dict(
+        remaining_ev_kwh=8.0, remaining_heater_kwh_by_window=_NO_HEAT,
+        pending_cycles=pending, base_load_kw=np.full(H_DAY, 0.4),
+        battery_spec=_batt(), initial_soc_kwh=4.0,
+    )
+    mip = solve_receding_horizon(now, prices, **kwargs)
+
+    real_solve = cp.Problem.solve
+    mip_calls: list[str] = []
+
+    def solve(self, *args, solver=None, **kw):
+        if self.is_mixed_integer():
+            mip_calls.append(solver)
+            raise cp.SolverError(f"{solver} MIP broken")
+        return real_solve(self, *args, solver=solver, **kw)
+
+    monkeypatch.setattr(cp.Problem, "solve", solve)
+    backup = solve_receding_horizon(now, prices, **kwargs)
+
+    assert mip_calls == ["HIGHS"]
+    assert backup.solver_status == "optimal"
+    assert backup.cycle_starts == mip.cycle_starts
+    assert backup.expected_cost == pytest.approx(mip.expected_cost, abs=1e-6)
+    np.testing.assert_allclose(backup.ev_power_kw, mip.ev_power_kw, atol=1e-5)
+    np.testing.assert_allclose(backup.battery_charge_kw, mip.battery_charge_kw, atol=1e-5)
+    np.testing.assert_allclose(backup.battery_discharge_kw, mip.battery_discharge_kw, atol=1e-5)
+
+
 def test_fallback_plan_respects_house_cap(monkeypatch):
-    _fail_solver(monkeypatch, {"HIGHS", "ECOS", "SCIPY", "GLPK_MI"}, raise_error=True)
+    _fail_solver(monkeypatch, {"HIGHS", "CLARABEL"}, raise_error=True)
     now = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
     base = np.full(H_DAY, 0.75)
     committed = [

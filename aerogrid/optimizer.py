@@ -75,8 +75,8 @@ Decision variables
                                        supplied.
 * ``soc[t] ∈ [0, capacity]``        — battery state-of-charge at the *start*
                                        of slot ``t`` (kWh). Has ``T + 1``
-                                       entries so ``soc[T]`` feeds the
-                                       terminal reward.
+                                       entries, ``soc[T]`` being the charge
+                                       left at the horizon end.
 
 Absent pending cycles the program has no binary variables and is a convex LP
 that HiGHS solves deterministically in milliseconds; the battery adds only
@@ -223,24 +223,21 @@ The exogenous Base Load also incurs cost, but it is a constant offset
 independent of the decision variables, so it is folded into the reported
 ``expected_cost`` afterwards rather than into the objective.
 
-When a battery is present, three further terms are added::
+When a battery is present, two further terms are added::
 
     + κ · Σ_t π[t] · (p_chg[t] − p_dis[t])    — battery net grid cost
-    − λ · soc[T]                              — terminal value of stored energy
     + κ · Σ_t ε[t] · (p_chg[t] + p_dis[t])    — throughput cost
 
 Charging draws from the grid (a cost) while discharging offsets load that
 would otherwise be imported (a saving), so the optimiser is rewarded for
-shifting discharge into expensive slots. The terminal reward, with
-``λ = (max(min_t π[t], 0) / 1000) · η_d``, prices the energy still stored at
-the end of the horizon at roughly its cheapest acquisition cost, and never
-below zero (ADR 0002). The throughput cost
-``ε[t] = k · max(0, −min_{s≥t} π[s])`` with
-``k = (1 − η_c·η_d) / (2·η_c·η_d)``, plus a tie-break ``ε₀ = 0.01`` per MWh
-when ``λ = 0``, keeps the battery from charging and discharging in the same
-slot (C7; see :func:`_battery_throughput_price`). It is not money: like the
-terminal reward and the slack penalty it is backed out of the reported
-``expected_cost``.
+shifting discharge into expensive slots. Energy left in the pack at the
+horizon end carries no value in the objective (ADR 0002). The throughput
+cost ``ε[t] = ε₀ + k · max(0, −min_{s≥t} π[s])`` with
+``k = (1 − η_c·η_d) / (2·η_c·η_d)`` and an always-on tie-break
+``ε₀ = 0.01`` per MWh keeps the battery from charging and discharging in the
+same slot and from cycling energy for no gain (C7; see
+:func:`_battery_throughput_price`). It is not money: like the slack penalty
+it is backed out of the reported ``expected_cost``.
 
 Every controlled load strictly *needs* to deliver its energy (EV deadline,
 heater windows, pending cycles via C6), so the optimiser will always start
@@ -249,13 +246,17 @@ using all of them — there is no separate "reservation" utility term.
 Solver chain and fallback
 =========================
 
-CVXPY is used to express the program. Solvers are tried in the order
-``HIGHS → ECOS → SCIPY`` for pure-LP problems (no pending cycles), and
-``HIGHS → GLPK_MI`` for mixed-integer problems. ECOS and SCIPY's linprog
-are LP-only and cannot solve the MIP form. A solver that raises or returns
-a non-optimal status hands over to the next one. If every candidate fails,
-:func:`solve_receding_horizon` returns a deterministic fallback schedule
-that:
+CVXPY is used to express the program. Pure-LP problems (no pending cycles)
+are tried with ``HIGHS → CLARABEL``; CLARABEL is an independent interior-point
+solver, whereas CVXPY's SCIPY interface runs the same HiGHS engine and so is
+no backup. Mixed-integer problems are tried with HiGHS alone, the only
+installed MIP solver; if it fails, the MIP is solved by enumeration instead:
+every combination of pending-cycle start slots (9 or fewer per cycle at the
+default 2 h window) is fixed in turn, each fixed problem is an LP solved with
+``HIGHS → CLARABEL``, and the cheapest one wins (ties go to the earlier
+start). A solver that raises or returns a non-optimal status hands over to
+the next one. If every candidate fails, :func:`solve_receding_horizon`
+returns a deterministic fallback schedule that:
 
 * charges the EV ASAP at rated power inside the availability window until
   ``remaining_ev_kwh`` is satisfied or the horizon ends,
@@ -292,6 +293,7 @@ reproducible to within solver-tolerance.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -332,11 +334,95 @@ _PER_SLOT_FACTOR = _SLOT_HOURS / 1000.0
 # measured in kWh, ρ = 1000 leaves a comfortable margin.
 _SLACK_PENALTY = 1000.0
 
+# Solver chains. CLARABEL is the LP backup: an independent interior-point
+# solver (CVXPY's SCIPY interface runs the same HiGHS engine, so it is no
+# backup). HiGHS is the only installed MIP solver; when it fails, the MIP is
+# solved by enumerating the pending-cycle start choices as LPs instead.
+_LP_SOLVER_CHAIN = ("HIGHS", "CLARABEL")
+_MIP_SOLVER_CHAIN = ("HIGHS",)
+_OPTIMAL = ("optimal", "optimal_inaccurate")
+
+
+def _solve_with_chain(prob: cp.Problem, solver_chain: tuple[str, ...]) -> str:
+    """Try each solver in turn until one returns an optimal status.
+
+    A solver that raises or returns a non-optimal status hands over to the
+    next one. Returns the last status seen (``"none"`` if every solver raised).
+    """
+    status = "none"
+    for solver in solver_chain:
+        logger.debug("solve_receding_horizon: trying solver=%s", solver)
+        try:
+            prob.solve(solver=solver)
+        except cp.SolverError:
+            logger.warning(
+                "solve_receding_horizon: solver=%s raised SolverError — trying next", solver,
+            )
+            continue
+        except Exception as e:                       # noqa: BLE001
+            logger.error(
+                "solve_receding_horizon: solver=%s raised unexpected error: %r", solver, e,
+            )
+            continue
+        status = prob.status
+        logger.info(
+            "solve_receding_horizon: solver=%s status=%s value=%s",
+            solver, status,
+            f"{prob.value:.4f}" if prob.value is not None else "None",
+        )
+        if _is_optimal(prob):
+            break
+        logger.warning(
+            "solve_receding_horizon: solver=%s returned status=%s — trying next",
+            solver, status,
+        )
+    return status
+
+
+def _is_optimal(prob: cp.Problem) -> bool:
+    return prob.value is not None and prob.status in _OPTIMAL
+
+
+def _solve_by_enumeration(
+    objective: cp.Minimize,
+    constraints: list,
+    start_vars: list[cp.Variable],
+) -> tuple[cp.Problem, str]:
+    """MIP backup: fix every combination of pending-cycle starts, solve each as an LP.
+
+    Each ``start_vars[i]`` is the (continuous) start-indicator vector of one
+    pending cycle; fixing it to a one-hot vector turns the program into an LP.
+    The cheapest optimal combination wins; ties go to the earliest starts,
+    since combinations are tried in lexicographic order and only a strictly
+    cheaper one replaces the incumbent. The winner is re-solved last so the
+    variables hold its solution. Returns the problem and its status.
+    """
+    def fixed(combo: tuple[int, ...]) -> cp.Problem:
+        return cp.Problem(objective, constraints + [
+            s == np.eye(s.size)[k] for s, k in zip(start_vars, combo)
+        ])
+
+    best: tuple[float, tuple[int, ...]] | None = None
+    prob, status = None, "none"
+    for combo in itertools.product(*(range(s.size) for s in start_vars)):
+        prob = fixed(combo)
+        status = _solve_with_chain(prob, _LP_SOLVER_CHAIN)
+        if _is_optimal(prob) and (best is None or prob.value < best[0] - 1e-9):
+            best = (float(prob.value), combo)
+    if best is None:
+        return prob, status
+    logger.warning(
+        "solve_receding_horizon: MIP solved by enumeration — starts %s", best[1],
+    )
+    prob = fixed(best[1])
+    status = _solve_with_chain(prob, _LP_SOLVER_CHAIN)
+    return prob, status
+
+
 # Tie-break cost ε₀ on battery throughput (currency/MWh charged or discharged),
-# used only when the terminal reward λ is zero. Breaks the tie between
-# charging and discharging in the same slot and doing neither when stored
-# energy is worth nothing; far too small to change any real dispatch decision
-# (0.001 ct/kWh).
+# applied to every slot. Breaks the tie between charging and discharging in
+# the same slot (or cycling energy for no gain) and doing neither; far too
+# small to change any real dispatch decision (0.001 ct/kWh).
 _BATTERY_THROUGHPUT_TIE_BREAK = 0.01
 
 
@@ -352,15 +438,14 @@ def _battery_throughput_price(prices: np.ndarray, battery_spec: BatterySpec) -> 
     never does it and stays an LP (no binary interlock). Charging in the most
     negative slot stays profitable, since ``k < 1``.
 
-    When every price is positive the terminal reward λ > 0 already makes the
-    waste a strict loss. When the cheapest price is zero or below, λ = 0 and
-    the waste can be a tie, so the tie-break ``ε₀`` is added to every slot.
+    Where the loss alone leaves the waste a tie (stored energy is worth
+    nothing at the horizon end, so losing some of it can cost nothing), the
+    tie-break ``ε₀`` added to every slot makes it a strict loss.
     """
     rt = battery_spec.eta_charge * battery_spec.eta_discharge
     future_min = np.minimum.accumulate(prices[::-1])[::-1]
     k = (1.0 - rt) / (2.0 * rt)
-    tie_break = _BATTERY_THROUGHPUT_TIE_BREAK if prices.min() <= 0.0 else 0.0
-    return tie_break + k * np.maximum(-future_min, 0.0)
+    return _BATTERY_THROUGHPUT_TIE_BREAK + k * np.maximum(-future_min, 0.0)
 
 
 def _floor_slot(now: datetime) -> datetime:
@@ -700,7 +785,7 @@ def solve_receding_horizon(
         p_chg = cp.Variable(horizon_slots, nonneg=True)
         p_dis = cp.Variable(horizon_slots, nonneg=True)
         # soc has horizon_slots + 1 entries: soc[0]..soc[T], where soc[0] is
-        # the given initial_soc_kwh and soc[T] appears in the terminal reward.
+        # the given initial_soc_kwh and soc[T] is the charge left at the end.
         soc = cp.Variable(horizon_slots + 1, nonneg=True)
 
     # C1: per-slot upper bound is rated_kw inside the EV charging window
@@ -712,14 +797,18 @@ def solve_receding_horizon(
         p_heat <= heater_spec.rated_kw,                            # C4 upper
     ]
 
-    # C6: pending-cycle start indicators (one boolean variable per allowed
-    # start slot). The "is-running" indicator z_a[t] is built as a linear
-    # combination of the s_a[t] (no extra integer variables needed because
-    # cycles cannot overlap themselves under the Σ s_a = 1 constraint).
+    # C6: pending-cycle start indicators (one per allowed start slot). The
+    # "is-running" indicator z_a[t] is built as a linear combination of the
+    # s_a[t] (no extra integer variables needed because cycles cannot overlap
+    # themselves under the Σ s_a = 1 constraint). s_a itself is continuous;
+    # the MIP ties it to a boolean twin (``integrality``) so the enumeration
+    # backup can instead fix it to each one-hot choice and solve an LP.
     pending_data: list[tuple[PendingCycle, cp.Variable, list]] = []
+    integrality: list = []
     for pc in pending_list:
         n_starts = pc.latest_start_slot - pc.earliest_start_slot + 1
-        s_a = cp.Variable(n_starts, boolean=True, name=f"s_{pc.appliance}")
+        s_a = cp.Variable(n_starts, nonneg=True, name=f"s_{pc.appliance}")
+        integrality.append(s_a == cp.Variable(n_starts, boolean=True))
         constraints.append(cp.sum(s_a) == 1)                                       # C6 equality
         # z_a[t] = sum of s_a[k] for k such that the cycle started at
         # earliest_start_slot+k is still running at slot t, i.e.
@@ -879,24 +968,6 @@ def solve_receding_horizon(
         for t in range(task.start_slot, min(task.start_slot + task.slots, horizon_slots)):
             committed_cost += rated * float(prices[t]) * _PER_SLOT_FACTOR
 
-    # Compute min_price and λ once; reused for both the terminal reward (objective)
-    # and the expected_cost back-out (section 8b). Avoids drift between the two.
-    min_price: float = float(prices.min()) if prices.size else 0.0
-    lambda_val: float = (
-        (max(min_price, 0.0) / 1000.0) * battery_spec.eta_discharge
-        if battery_spec is not None
-        else 0.0
-    )
-
-    # Value-of-stored-energy terminal reward (ADR 0002): reward leftover SoC at
-    # horizon end at its cheapest acquisition cost × η_d, floored at zero so a
-    # negative price never makes stored energy a liability.
-    #   λ = (max(min(π), 0) / 1000) × η_d   [$/kWh delivered]
-    # Adding -λ·soc[T] to a minimisation objective rewards storing energy.
-    terminal_reward: cp.Expression | float = 0.0
-    if battery_spec is not None:
-        terminal_reward = -lambda_val * soc[horizon_slots]
-
     throughput_term: cp.Expression | float = 0.0
     if battery_spec is not None:
         throughput_price = _battery_throughput_price(prices, battery_spec)
@@ -906,45 +977,23 @@ def solve_receding_horizon(
 
     slack_term = _SLACK_PENALTY * (slack_ev + sum(slack_heat.values()))
     obj = cp.Minimize(
-        actual_cost + battery_net_cost + pending_cost + slack_term + terminal_reward
-        + throughput_term
+        actual_cost + battery_net_cost + pending_cost + slack_term + throughput_term
     )
-    prob = cp.Problem(obj, constraints)
 
     # --- 7. Solver chain ---------------------------------------------------- #
-    # ECOS and SCIPY's linprog cannot solve mixed-integer problems, so
-    # restrict to MIP-capable solvers when there are boolean variables.
     if pending_data:
-        solver_chain = ("HIGHS", "GLPK_MI")
+        prob = cp.Problem(obj, constraints + integrality)
+        status = _solve_with_chain(prob, _MIP_SOLVER_CHAIN)
+        if not _is_optimal(prob):
+            logger.warning(
+                "solve_receding_horizon: MIP status=%s — enumerating start choices", status,
+            )
+            prob, status = _solve_by_enumeration(
+                obj, constraints, [s_a for _pc, s_a, _z in pending_data],
+            )
     else:
-        solver_chain = ("HIGHS", "ECOS", "SCIPY")
-    status = "none"
-    for solver in solver_chain:
-        logger.debug("solve_receding_horizon: trying solver=%s", solver)
-        try:
-            prob.solve(solver=solver)
-            status = prob.status
-            logger.info(
-                "solve_receding_horizon: solver=%s status=%s value=%s",
-                solver, status,
-                f"{prob.value:.4f}" if prob.value is not None else "None",
-            )
-            if prob.value is not None and status in ("optimal", "optimal_inaccurate"):
-                break
-            logger.warning(
-                "solve_receding_horizon: solver=%s returned status=%s — trying next",
-                solver, status,
-            )
-        except cp.SolverError:
-            logger.warning(
-                "solve_receding_horizon: solver=%s raised SolverError — trying next", solver,
-            )
-            continue
-        except Exception as e:                       # noqa: BLE001
-            logger.error(
-                "solve_receding_horizon: solver=%s raised unexpected error: %r", solver, e,
-            )
-            continue
+        prob = cp.Problem(obj, constraints)
+        status = _solve_with_chain(prob, _LP_SOLVER_CHAIN)
 
     # --- 8. Assemble the Schedule ------------------------------------------- #
     sched = Schedule(
@@ -967,7 +1016,7 @@ def solve_receding_horizon(
     )
 
     # --- 8a. Solver failure → deterministic fallback ------------------------ #
-    if prob.value is None or prob.status not in ("optimal", "optimal_inaccurate"):
+    if not _is_optimal(prob):
         logger.warning(
             "solve_receding_horizon: no optimal solution (status=%s) — using ASAP fallback",
             status,
@@ -1062,21 +1111,18 @@ def solve_receding_horizon(
         [f"{v:.2f}" for v in sched.heater_power_kw[: min(8, horizon_slots)]],
     )
 
-    # expected_cost = objective − slack_penalty_term − terminal_reward_term
-    #               − throughput_term + committed_cost + base_load_cost
-    # The terminal reward is a negative term in the minimisation objective; we subtract it
-    # back out so expected_cost reflects real net grid expenditure (not negative energy profit).
+    # expected_cost = objective − slack_penalty_term − throughput_term
+    #               + committed_cost + base_load_cost
+    # The throughput cost steers the LP but is not money, so it is backed out.
     # Base-Load cost is added here and to baseline_cost so the savings ratio measures money
     # off the *total* bill — the only thing a Home Battery exists to reduce (ADR 0003).
-    terminal_reward_val = 0.0
     throughput_val = 0.0
-    if battery_spec is not None and soc is not None:
-        terminal_reward_val = -lambda_val * float(soc.value[horizon_slots])
+    if battery_spec is not None:
         throughput_val = float(throughput_term.value)
     base_load_cost = float((_base_load * prices).sum() * _PER_SLOT_FACTOR)
     sched.expected_cost = float(prob.value - _SLACK_PENALTY * (
         float(slack_ev.value or 0.0) + sum(float(s.value or 0.0) for s in slack_heat.values())
-    ) - terminal_reward_val - throughput_val + committed_cost + base_load_cost)
+    ) - throughput_val + committed_cost + base_load_cost)
     sched.baseline_cost = _baseline_cost(
         prices, remaining_ev_kwh, remaining_heater_kwh_by_window,
         ev_mask, heater_masks, ev_spec.rated_kw, heater_spec.rated_kw,
