@@ -2,7 +2,7 @@
 
 AeroGrid is a simulation of a house with an EV, a hot-water heater, a dishwasher, a washing machine and an optional home battery. It decides when each flexible load should run so that most electricity is bought in the cheapest hours, and compares that plan with simply switching everything on straight away. It is written for developers and researchers interested in home energy management; it does not control real devices.
 
-**Headline result (simulation, 48 h on real German prices from 3 Apr 2026, stored in `notebooks/06_end_to_end.ipynb`):** shifting loads cut the electricity cost by 37 % versus "switch on straight away" (€5.95 vs €9.38); adding a 13.5 kWh home battery cut it by 48 % (€4.91).
+**Headline result (simulation, 48 h on real German prices from 3 Apr 2026, stored in `notebooks/06_end_to_end.ipynb`):** shifting loads cut the electricity cost by 36 % versus "switch on straight away" (€5.94 vs €9.31); adding a 13.5 kWh home battery cut it by 51 % (€4.53).
 
 **Scope:** solar panels are not modelled, and the only price data used is the German/Luxembourg day-ahead market (SMARD DE-LU). The savings only apply to a tariff whose price changes during the day.
 
@@ -70,7 +70,7 @@ TriggerManager fires  →  forecast_price  →  optimize (LP/MIP)
                       →  propose_reschedule  →  hitl_gate  →  commit_plan
 ```
 
-Triggers: new appliance onset, ≥ 25 % price surprise, EV deadline slip, or 15-min periodic resync. A 30 s cooldown prevents thrashing.
+Triggers: new appliance onset, ≥ 25 % price surprise, EV deadline slip (the EV falling behind the plan it is executing), or 15-min periodic resync. A 30 s cooldown prevents thrashing.
 
 ---
 
@@ -99,12 +99,12 @@ Pure **LP** in the common case; collapses to a small **MIP** when `pending_cycle
 **Constraints** — the physical and contractual limits the plan must respect:
 
 - **C1 — EV charger rating + availability gate.** The EV can only draw up to its rated power, and only while it's plugged in (`p_ev[t] = 0` outside the availability window).
-- **C2 — EV energy deadline.** The EV must have its required kWh by the deadline hour. If the deadline falls inside the horizon it's enforced hard at that slot; if it's beyond the horizon, this horizon must deliver its proportional share (plus a safety margin) so charging isn't deferred forever.
-- **C3 — heater per-window energy.** Each heater deadline defines a window (gap since the previous deadline); the heater must deliver that window's kWh by the time the deadline hour arrives.
+- **C2 — EV energy deadline.** The EV must have its required kWh by the deadline hour. If the deadline falls inside the horizon it's enforced hard at that slot; if it's beyond the horizon, this horizon must deliver its proportional share (plus a safety margin, capped at what the car still needs) so charging isn't deferred forever. The EV also never takes more than it still needs before the deadline (and at most one daily need in the next night's window), so a negative price cannot make it buy energy it has no room for.
+- **C3 — heater per-window energy.** Each heater deadline defines a window (gap since the previous deadline); the heater must deliver that window's kWh by the time the deadline hour arrives, and never more than that. A window with no slot inside the horizon is not constrained until it comes into view.
 - **C4 — heater rating.** The heater can't draw more than its rated power in any slot.
 - **C5 — house power cap + no-export.** Total draw in every slot (Base Load + EV + heater + battery charge − battery discharge) stays between 0 and the house cap — never exceeding the grid connection, and never pushing power back to the grid (`0 ≤ loads + p_chg − p_dis ≤ cap`).
 - **C6 — pending cycle placement.** Each deferrable cycle appliance (dishwasher, washing machine) awaiting a decision is scheduled to start in exactly one allowed slot.
-- **C7 — battery SoC dynamics + bounds** *(battery only)*. State of charge evolves slot-to-slot with charge/discharge efficiencies (`soc[t+1] = soc[t] + η_c·p_chg[t]·Δt − p_dis[t]·Δt/η_d`) and stays within the battery's min/max capacity.
+- **C7 — battery SoC dynamics + bounds** *(battery only)*. State of charge evolves slot-to-slot with charge/discharge efficiencies (`soc[t+1] = soc[t] + η_c·p_chg[t]·Δt − p_dis[t]·Δt/η_d`) and stays within the battery's min/max capacity. The losses alone do not stop the LP from charging and discharging in the same slot (it does so when the wasted energy is worth nothing, and at negative prices the waste pays); the throughput cost in the objective does, without binary variables.
 
 The EV and heater energy targets (C2, C3) are enforced as **soft** constraints via slack variables (`σ_ev`, `σ_heat`): rather than making the problem infeasible when the power cap makes a target unreachable, the shortfall is allowed but heavily penalized in the objective.
 
@@ -113,14 +113,15 @@ The EV and heater energy targets (C2, C3) are enforced as **soft** constraints v
 **Objective** — what the optimizer minimizes:
 
 ```
-forecast net-grid cost  +  1000 × (energy slacks)  −  terminal reward
+forecast net-grid cost  +  1000 × (energy slacks)  −  terminal reward  +  throughput cost
 ```
 
 - **Forecast net-grid cost** is the electricity bill: each slot's net grid draw (in kWh) times that slot's forecast price, summed over the horizon. Shifting loads into cheap slots is what lowers this term.
 - **1000 × slack penalties** makes any C2/C3 energy shortfall expensive, so the optimizer only ever leaves a target unmet when the power cap physically forces it to — and even then, by the smallest possible amount.
-- **Terminal reward** *(battery only)* values energy still stored at the end of the horizon: `λ·soc[T]` with `λ = min(price)/1000 × η_d`. Without it the optimizer would dump the battery in the final slots (stored energy looks worthless past the horizon edge); the reward prices it at roughly the cheapest price seen, so the battery is held for the next window instead.
+- **Terminal reward** *(battery only)* values energy still stored at the end of the horizon: `λ·soc[T]` with `λ = max(min(price), 0)/1000 × η_d`, never below zero. In re-runs on SMARD prices it changed none of the executed first slots, and closed-loop bills match to the cent without it (ADR 0002); it is kept as a guard, not as a mechanism that changes results.
+- **Throughput cost** *(battery only)* is a small cost per kWh charged or discharged, `ε[t] = k·max(0, −min future price)` with `k = (1 − η_c·η_d)/(2·η_c·η_d)` (≈ 0.054), plus a 0.01 €/MWh tie-break when `λ = 0`. It is zero whenever all prices are positive and only makes same-slot charge + discharge unprofitable. Like the slack and the terminal reward it is not part of the reported `expected_cost`.
 
-**Fallback:** if every solver fails, the function returns a deterministic ASAP plan (EV charges from first open slot, heater runs from start of each window, cycles placed at `earliest_start_slot`, battery idles at 0 kW).
+**Solver chain and fallback:** solvers are tried in order (HiGHS → ECOS → SciPy for the LP, HiGHS → GLPK_MI for the MIP); one that raises or returns a non-optimal status hands over to the next. If every solver fails, the function returns a deterministic ASAP plan (EV charges from first open slot, heater runs from start of each window, both cut back to stay under the house cap, cycles placed at `earliest_start_slot`, battery idles at 0 kW).
 
 ---
 
@@ -184,15 +185,15 @@ Outputs land in `data/cache/`:
 
 ### Slot-log columns (per strategy prefix)
 
-Each strategy contributes a block of `<prefix>_*` columns to `slot_log.parquet`. Key fields:
+Each strategy contributes a block of `<prefix>_*` columns to `slot_log.parquet`. The row for a slot is written once the slot has ended: power columns are the slot's mean power, from the energy that actually flowed each second (an EV that fills up or a setpoint that changes mid-slot is billed exactly), and the state columns (`_soc_kwh`, `_remaining_ev_kwh`, `_active_cycles`) are taken at the start of the slot. Key fields:
 
 | column | type | description |
 |---|---|---|
-| `<prefix>_ev_kw` | float | EV charging power this slot (kW) |
-| `<prefix>_heater_kw` | float | Heater power this slot (kW) |
+| `<prefix>_ev_kw` | float | Mean EV charging power this slot (kW) |
+| `<prefix>_heater_kw` | float | Mean heater power this slot (kW) |
 | `<prefix>_base_load_kw` | float | Always-on Base Load (fridge, lights, standby, cooking) — exogenous, not shifted |
-| `<prefix>_battery_charge_kw` | float | Home Battery charge power (kW); 0 for non-battery strategies |
-| `<prefix>_battery_discharge_kw` | float | Home Battery discharge power (kW); 0 for non-battery strategies |
+| `<prefix>_battery_charge_kw` | float | Mean Home Battery charge power (kW); 0 for non-battery strategies |
+| `<prefix>_battery_discharge_kw` | float | Mean Home Battery discharge power (kW); 0 for non-battery strategies |
 | `<prefix>_soc_kwh` | float | Home Battery state of charge at slot start (kWh); 0 for non-battery strategies |
 | `<prefix>_net_grid_kw` | float | Net grid import: gross load + charge − discharge; equals total load when no battery |
 | `<prefix>_slot_cost_eur` | float | Cost of this slot (EUR), on `net_grid_kw` |
