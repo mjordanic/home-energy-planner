@@ -261,3 +261,20 @@ def test_no_export_over_multi_slot_run_with_shrinking_load():
         price = 100.0  # EUR/MWh
         slot_cost = net_grid * (15 / 60) * (price / 1000.0)
         assert slot_cost >= -1e-9, f"slot {i}: negative cost={slot_cost:.6f}"
+
+
+def test_replannable_onset_keeps_original_onset_time():
+    onset = datetime(2026, 4, 15, 20, 0, tzinfo=timezone.utc)
+    c = CommitTracker()
+    assert c.adopt_cycle_start(
+        appliance="dishwasher", slots=8, expected_kwh=5.0,
+        start_at=onset + timedelta(hours=1), now=onset,
+    )
+    later = onset + timedelta(minutes=45)
+    # Same start again → nothing changed.
+    assert not c.adopt_cycle_start(
+        appliance="dishwasher", slots=8, expected_kwh=5.0,
+        start_at=onset + timedelta(hours=1), now=later,
+    )
+    (re_offered,) = c.replannable_onsets(later)
+    assert re_offered.timestamp == onset

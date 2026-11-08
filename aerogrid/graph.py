@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import pickle
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import numpy as np
 from langgraph.checkpoint.memory import InMemorySaver
@@ -155,6 +155,7 @@ def _pending_cycles_from_onsets(
     committed_apps: set[str],
     horizon_slots: int,
     window_hours: float = HITL_RESCHEDULE_WINDOW_HOURS,
+    now: datetime | None = None,
 ) -> list[PendingCycle]:
     """Convert a list of fresh user-onset events into ``PendingCycle`` inputs.
 
@@ -170,6 +171,10 @@ def _pending_cycles_from_onsets(
         horizon_slots: Optimiser horizon (used to clip ``latest_start``).
         window_hours: User-allowed forward shift (default
             ``HITL_RESCHEDULE_WINDOW_HOURS``).
+        now: Start of the horizon. When given, the window is measured from
+            each onset's own timestamp, so a deferred cycle re-offered by
+            ``CommitTracker.replannable_onsets`` can never slide past its
+            original window end.
 
     Returns:
         Zero or more pending cycles, deduplicated by appliance name (the
@@ -188,7 +193,11 @@ def _pending_cycles_from_onsets(
             continue
         if spec.cycle_slots > horizon_slots:
             continue
-        last_start = min(window_slots, horizon_slots - spec.cycle_slots)
+        allowed_slots = window_slots
+        if now is not None:
+            elapsed_slots = (now - onset.timestamp).total_seconds() / 60.0 / SLOT_MINUTES
+            allowed_slots = max(0, int(round(window_slots - elapsed_slots)))
+        last_start = min(allowed_slots, horizon_slots - spec.cycle_slots)
         if last_start < 0:
             continue
         out.append(PendingCycle(
@@ -285,6 +294,7 @@ def build_graph(
             state.get("new_onsets"),
             committed_apps=committed_apps,
             horizon_slots=horizon_slots,
+            now=now,
         )
         logger.info(
             "graph.n_optimize: now=%s remaining_ev=%.2fkWh remaining_heater=%s "
@@ -400,6 +410,7 @@ def build_graph(
                 state.get("new_onsets"),
                 committed_apps=committed_apps,
                 horizon_slots=horizon_slots,
+                now=state["now"],
             )
             if pc.appliance != appliance
         ]
@@ -413,6 +424,15 @@ def build_graph(
                 committed_tasks=committed,
                 pending_cycles=[pinned_now, *other_pending],
                 horizon_slots=horizon_slots,
+                # Same Base Load and battery inputs as n_optimize, so
+                # cost_now and cost_proposed are like for like and the
+                # decline plan is a real plan.
+                base_load_kw=np.asarray(
+                    get_base_load_kw(state["now"], n_slots=horizon_slots),
+                    dtype=float,
+                ),
+                battery_spec=state.get("battery_spec"),
+                initial_soc_kwh=float(state.get("soc_kwh") or 0.0),
             )
         except Exception as e:                       # noqa: BLE001
             logger.warning(

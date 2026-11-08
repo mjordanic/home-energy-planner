@@ -2,7 +2,7 @@
 
 AeroGrid is a simulation of a house with an EV, a hot-water heater, a dishwasher, a washing machine and an optional home battery. It decides when each flexible load should run so that most electricity is bought in the cheapest hours, and compares that plan with simply switching everything on straight away. It is written for developers and researchers interested in home energy management; it does not control real devices.
 
-**Headline result (simulation, 48 h on real German prices from 3 Apr 2026, stored in `notebooks/06_end_to_end.ipynb`):** shifting loads cut the electricity cost by 29 % versus "switch on straight away" (€6.83 vs €9.61); adding a 13.5 kWh home battery cut it by 47 % (€5.10).
+**Headline result (simulation, 48 h on real German prices from 3 Apr 2026, stored in `notebooks/06_end_to_end.ipynb`):** shifting loads cut the electricity cost by 37 % versus "switch on straight away" (€5.95 vs €9.38); adding a 13.5 kWh home battery cut it by 48 % (€4.91).
 
 **Scope:** solar panels are not modelled, and the only price data used is the German/Luxembourg day-ahead market (SMARD DE-LU). The savings only apply to a tariff whose price changes during the day.
 
