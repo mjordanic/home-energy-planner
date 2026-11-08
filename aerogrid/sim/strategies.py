@@ -70,7 +70,7 @@ from aerogrid.config import (
 )
 from aerogrid.graph import build_graph, make_thread_id as _default_make_thread_id
 from aerogrid.price_oracle import make_oracle
-from aerogrid.triggers import TriggerManager
+from aerogrid.triggers import TriggerManager, planned_ev_kwh_before_deadline
 from aerogrid.types import ApplianceOnset, Sample
 
 logger = logging.getLogger(__name__)
@@ -82,7 +82,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SlotRecord:
-    """Per-strategy snapshot at one 15-minute slot boundary.
+    """Per-strategy record of one 15-minute slot.
+
+    Power fields (``*_kw``) are the slot's mean power, from energy accrued
+    every second, and ``slot_cost_eur`` bills that energy at the slot's
+    price. ``remaining_ev_kwh``, ``active_cycles`` and ``soc_kwh`` are the
+    state at the start of the slot.
 
     The digital twin assembles one row per slot by flattening every
     strategy's SlotRecord (column-prefixed by ``strategy.name`` via
@@ -244,7 +249,7 @@ class Strategy(ABC):
     :meth:`has_pending_appliance`
         Used by the digital twin to gate onsets across strategies.
     :meth:`get_slot_record`
-        Snapshot at a 15-min slot boundary; ALSO accrues this slot's cost.
+        Record for a 15-min slot once it has ended; ALSO bills its cost.
 
     Provided:
 
@@ -259,6 +264,21 @@ class Strategy(ABC):
         self.name = name
         self.cumulative_cost = 0.0
         self._pending_events: list[dict[str, Any]] = []
+        # Energy (kWh) per flow accrued second by second since the current
+        # slot opened; billed and cleared by get_slot_record.
+        self._slot_kwh: dict[str, float] = {}
+
+    def _accrue(self, dt_s: float, **flows_kw: float) -> None:
+        """Add ``dt_s`` seconds of each named flow (kW) to the open slot."""
+        for k, kw in flows_kw.items():
+            self._slot_kwh[k] = self._slot_kwh.get(k, 0.0) + kw * dt_s / 3600.0
+
+    def _close_slot(self) -> dict[str, float]:
+        """Return the open slot's mean power per flow (kW) and clear it."""
+        slot_h = SLOT_MINUTES / 60.0
+        mean_kw = {k: v / slot_h for k, v in self._slot_kwh.items()}
+        self._slot_kwh = {}
+        return mean_kw
 
     @abstractmethod
     def tick(
@@ -276,7 +296,12 @@ class Strategy(ABC):
 
     @abstractmethod
     def get_slot_record(self, now: datetime, price_eur_mwh: float) -> SlotRecord:
-        """Accrue this slot's cost and return a SlotRecord snapshot."""
+        """Bill the slot that started at ``now`` and has just ended.
+
+        Called once the slot is over; powers in the record are the slot's
+        mean, from the energy accrued every second, so setpoint changes
+        mid-slot are billed exactly.
+        """
 
     def flush_events(
         self,
@@ -332,6 +357,8 @@ class BaselineStrategy(Strategy):
         # Guards: prevent repeated resets within the same clock-hour.
         self._last_ev_reset: datetime | None = None
         self._last_heater_resets: dict[int, datetime] = {}
+        # (remaining EV kWh, active cycles) after the slot's first second.
+        self._slot_open_state: tuple[float, list[str]] = (self.remaining_ev_kwh, [])
 
     # ------------------------------------------------------------------ #
     def has_pending_appliance(self, appliance: str) -> bool:
@@ -386,9 +413,8 @@ class BaselineStrategy(Strategy):
             self._ev_power_kw = ev_rated
         else:
             self._ev_power_kw = 0.0
-        self.remaining_ev_kwh = max(
-            0.0, self.remaining_ev_kwh - self._ev_power_kw * dt_s / 3600.0
-        )
+        ev_kwh = min(self._ev_power_kw * dt_s / 3600.0, self.remaining_ev_kwh)
+        self.remaining_ev_kwh -= ev_kwh
 
         # --- Heater: rated power at window start until requirement met ----
         active_h = _active_heater_window(now)
@@ -397,10 +423,11 @@ class BaselineStrategy(Strategy):
             self.remaining_heater_kwh_by_window.get(active_h, 0.0)
             if active_h is not None else 0.0
         )
+        heater_kwh = 0.0
         if active_h is not None and need_before > 1e-6:
             self._heater_power_kw = heater_rated
-            delivered = heater_rated * dt_s / 3600.0
-            self.remaining_heater_kwh_by_window[active_h] = max(0.0, need_before - delivered)
+            heater_kwh = min(heater_rated * dt_s / 3600.0, need_before)
+            self.remaining_heater_kwh_by_window[active_h] = need_before - heater_kwh
         else:
             self._heater_power_kw = 0.0
 
@@ -449,6 +476,20 @@ class BaselineStrategy(Strategy):
                 detail=f"source={onset.source} confidence={onset.confidence:.2f}",
             )
             self._start_cycle(onset.appliance, now)
+
+        # --- Accrue this second's energy for billing ----------------------
+        if not self._slot_kwh:
+            # First second of the slot: the state the record reports.
+            self._slot_open_state = (
+                self.remaining_ev_kwh, [a for a, _, _ in self._active_cycles],
+            )
+        self._accrue(
+            dt_s,
+            ev=ev_kwh * 3600.0 / dt_s,
+            heater=heater_kwh * 3600.0 / dt_s,
+            cycle=sum(pwr for _, _, pwr in self._active_cycles),
+            base=get_base_load_kw(now, n_slots=1)[0],
+        )
 
         # --- Emit setpoint transition events ------------------------------
         if prev_ev_kw < 1e-6 and self._ev_power_kw > 1e-6:
@@ -509,24 +550,27 @@ class BaselineStrategy(Strategy):
 
     # ------------------------------------------------------------------ #
     def get_slot_record(self, now: datetime, price_eur_mwh: float) -> SlotRecord:
-        cycle_kw = sum(pwr for _, _, pwr in self._active_cycles)
+        kw = self._close_slot()
+        ev_kw = kw.get("ev", 0.0)
+        heater_kw = kw.get("heater", 0.0)
+        cycle_kw = kw.get("cycle", 0.0)
         # Base Load: always-on inflexible demand (ADR 0003).
-        base_kw = get_base_load_kw(now, n_slots=1)[0]
-        total_kw = self._ev_power_kw + self._heater_power_kw + cycle_kw + base_kw
+        base_kw = kw.get("base", 0.0)
+        total_kw = ev_kw + heater_kw + cycle_kw + base_kw
         slot_cost = total_kw * (SLOT_MINUTES / 60.0) * (price_eur_mwh / 1000.0)
         self.cumulative_cost += slot_cost
 
         return SlotRecord(
             timestamp=now,
-            ev_kw=self._ev_power_kw,
-            heater_kw=self._heater_power_kw,
+            ev_kw=ev_kw,
+            heater_kw=heater_kw,
             cycle_kw=cycle_kw,
             base_load_kw=base_kw,
             total_kw=total_kw,
             slot_cost_eur=slot_cost,
             cum_cost_eur=self.cumulative_cost,
-            remaining_ev_kwh=self.remaining_ev_kwh,
-            active_cycles=[a for a, _, _ in self._active_cycles],
+            remaining_ev_kwh=self._slot_open_state[0],
+            active_cycles=self._slot_open_state[1],
             # No battery — net_grid_kw equals gross load.
             net_grid_kw=total_kw,
         )
@@ -607,6 +651,13 @@ class OptimizerStrategy(Strategy):
 
         # Per-replan state
         self._previous_plan: Any = None
+        # remaining_ev_kwh minus what the adopted plan delivers before the
+        # deadline, at adoption time; drift from it is a deadline slip.
+        self._ev_plan_gap_kwh: float = 0.0
+        # (remaining EV kWh, SoC, active cycles) after the slot's first second.
+        self._slot_open_state: tuple[float, float, list[str]] = (
+            self.commit.remaining_ev_kwh, self.commit.soc_kwh, [],
+        )
         self._last_solver_status: str | None = None
         self._last_expected_cost: float | None = None
         self._last_trigger_kind: str | None = None  # cleared after each slot record
@@ -682,9 +733,8 @@ class OptimizerStrategy(Strategy):
         2. Emit ``onset_received`` for each gated onset.
         3. Trigger evaluation; if it fires, run the slow-path graph and
            adopt the resulting plan.
+        4. Accrue this second's energy for billing.
         """
-        from langgraph.types import Command  # lazy
-
         now = sample.t
 
         # 1. Advance commit-tracker state.
@@ -707,6 +757,43 @@ class OptimizerStrategy(Strategy):
         else:
             offsettable_kw = None
         self.commit.tick(now, dt_s, offsettable_load_kw=offsettable_kw)
+        # Bill what actually flowed: the tracker's applied power, which stops
+        # when the EV is full, the heater window is met or the battery limits.
+        first_second = not self._slot_kwh
+        self._accrue(
+            dt_s,
+            ev=self.commit.ev_power_applied_kw,
+            heater=self.commit.heater_power_applied_kw,
+            base=get_base_load_kw(now, n_slots=1)[0],
+            chg=self.commit.battery_charge_applied_kw,
+            dis=self.commit.battery_discharge_applied_kw,
+        )
+
+        self._replan_if_triggered(now, sample, onsets)
+
+        running = self.commit.running_committed_tasks(now)
+        self._accrue(dt_s, cycle=sum(APPLIANCES[t.appliance].rated_kw for t in running))
+        if first_second:
+            self._slot_open_state = (
+                self.commit.remaining_ev_kwh, self.commit.soc_kwh,
+                [t.appliance for t in running],
+            )
+
+    def _ev_behind_plan_kwh(self, now: datetime) -> float | None:
+        """kWh the EV has fallen behind the adopted plan (``None`` before any plan)."""
+        if self._previous_plan is None:
+            return None
+        planned = planned_ev_kwh_before_deadline(self._previous_plan, now)
+        return self.commit.remaining_ev_kwh - planned - self._ev_plan_gap_kwh
+
+    def _replan_if_triggered(
+        self,
+        now: datetime,
+        sample: Sample,
+        onsets: list[ApplianceOnset],
+    ) -> None:
+        """Evaluate the triggers and, if one fires, re-plan and adopt the result."""
+        from langgraph.types import Command  # lazy
 
         new_onsets = list(onsets)
         for onset in new_onsets:
@@ -725,6 +812,7 @@ class OptimizerStrategy(Strategy):
             price_forecast=None,
             remaining_ev_kwh=self.commit.remaining_ev_kwh,
             ev_power_setpoint_kw=self.commit.ev_power_setpoint_kw,
+            ev_behind_plan_kwh=self._ev_behind_plan_kwh(now),
         )
         if trigger is None:
             return
@@ -788,6 +876,10 @@ class OptimizerStrategy(Strategy):
         if new_plan is not None:
             self._adopt_plan(now, new_plan)
             self._previous_plan = new_plan
+            self._ev_plan_gap_kwh = (
+                self.commit.remaining_ev_kwh
+                - planned_ev_kwh_before_deadline(new_plan, now)
+            )
             self._last_solver_status = new_plan.solver_status
             self._last_expected_cost = float(new_plan.expected_cost)
 
@@ -933,12 +1025,13 @@ class OptimizerStrategy(Strategy):
 
     # ------------------------------------------------------------------ #
     def get_slot_record(self, now: datetime, price_eur_mwh: float) -> SlotRecord:
-        running_tasks = self.commit.running_committed_tasks(now)
-        cycle_kw = sum(APPLIANCES[t.appliance].rated_kw for t in running_tasks)
-        ev_kw = self.commit.ev_power_setpoint_kw
-        heater_kw = self.commit.heater_power_setpoint_kw
+        kw = self._close_slot()
+        remaining_ev_kwh, soc_at_start, active_cycles = self._slot_open_state
+        cycle_kw = kw.get("cycle", 0.0)
+        ev_kw = kw.get("ev", 0.0)
+        heater_kw = kw.get("heater", 0.0)
         # Base Load: always-on inflexible demand (ADR 0003).
-        base_kw = get_base_load_kw(now, n_slots=1)[0]
+        base_kw = kw.get("base", 0.0)
         total_kw = ev_kw + heater_kw + cycle_kw + base_kw
 
         # Battery fields — only populated when battery is enabled.
@@ -946,13 +1039,13 @@ class OptimizerStrategy(Strategy):
         batt_dis_kw = 0.0
         soc = 0.0
         if self._battery_enabled:
-            batt_chg_kw = self.commit.battery_charge_setpoint_kw
-            # Use the *applied* (throttled) discharge — the amount that
-            # actually drained the SoC and offset household load this slot.
-            # This is always ≤ the setpoint; using it here ensures billed
-            # discharge matches the SoC drain and net_grid_kw ≥ 0 (ADR 0001).
-            batt_dis_kw = self.commit.battery_discharge_applied_kw
-            soc = self.commit.soc_kwh
+            # Applied charge and (throttled) discharge — what actually moved
+            # the SoC and offset household load, second by second. Billing
+            # these keeps the books equal to the SoC change and
+            # net_grid_kw ≥ 0 (ADR 0001).
+            batt_chg_kw = kw.get("chg", 0.0)
+            batt_dis_kw = kw.get("dis", 0.0)
+            soc = soc_at_start
 
         # Net grid draw: gross loads + charge draw − discharge offset (ADR 0001).
         # With applied (throttled) discharge, net_grid_kw is guaranteed ≥ 0.
@@ -973,8 +1066,8 @@ class OptimizerStrategy(Strategy):
             total_kw=total_kw,
             slot_cost_eur=slot_cost,
             cum_cost_eur=self.cumulative_cost,
-            remaining_ev_kwh=self.commit.remaining_ev_kwh,
-            active_cycles=[t.appliance for t in running_tasks],
+            remaining_ev_kwh=remaining_ev_kwh,
+            active_cycles=active_cycles,
             battery_charge_kw=batt_chg_kw,
             battery_discharge_kw=batt_dis_kw,
             soc_kwh=soc,

@@ -48,8 +48,8 @@ power consumes cap headroom for the slots they still occupy).
 When a battery is configured (the caller passes ``battery_spec``), two
 further *continuous* controls are co-optimised: the battery charge power
 ``p_chg[t]`` and discharge power ``p_dis[t]``, linked by the state-of-charge
-``soc[t]`` (see C7). No binaries are added — round-trip losses alone deter
-simultaneous charge/discharge, so the program stays a pure LP.
+``soc[t]`` (see C7). No binaries are added — a small throughput cost makes
+simultaneous charge/discharge unprofitable, so the program stays a pure LP.
 
 An exogenous **Base Load** (``base_load_kw``) — the always-on inflexible
 household demand (fridge + lights + standby + cooking) — is added to the
@@ -121,6 +121,12 @@ C2. **EV energy / deadline** — state-dependent. Let ``E`` be the kWh the EV
 
             Δt · Σ_{t=0}^{T-1} p_ev[t] + σ_ev  ≥  E · (H / τ) · γ
 
+    (the right-hand side is capped at ``E``). The EV also takes no more than
+    it needs: ``Δt · Σ_{t<t_d} p_ev[t] ≤ E`` (``t_d = T`` when the deadline
+    is beyond the horizon) and, for slots after the
+    deadline (the next night's window), ``Δt · Σ_{t≥t_d} p_ev[t] ≤
+    EV_DAILY_NEED_KWH``.
+
     The non-negative slack ``σ_ev`` keeps the LP feasible when the house
     power cap (C5) makes the right-hand side unattainable. A heavy penalty
     ``ρ · σ_ev`` (with ``ρ ≡ _SLACK_PENALTY = 1000``) drives ``σ_ev`` to
@@ -142,6 +148,10 @@ C3. **Heater energy per deadline window** — for every entry
     contribute nothing yet (window starts in the future) or contribute the
     full amount (window starts in the past and we are already inside the
     next iteration of the same window).
+
+    The heater also takes no more than it needs: the slots of the current
+    iteration of window ``w`` deliver at most ``remaining_w``, and those of
+    any later iteration in view at most that window's ``kwh_required``.
 
 C4. **Heater rating** ::
 
@@ -188,9 +198,11 @@ C7. **Battery SoC dynamics and bounds** (only when ``battery_spec`` is
         0 ≤ soc[t] ≤ capacity
         0 ≤ p_chg[t] ≤ P_chg_max,   0 ≤ p_dis[t] ≤ P_dis_max
 
-    Charging is lossy by ``η_c`` and discharging by ``η_d``; the round-trip
-    loss alone makes simultaneous charge/discharge suboptimal, so no binary
-    interlock is needed and the program stays an LP.
+    Charging is lossy by ``η_c`` and discharging by ``η_d``. The losses alone
+    do not rule out simultaneous charge/discharge: the optimum may do it when
+    the wasted energy is worth nothing, and at negative prices the waste pays.
+    The throughput cost in the objective makes it unprofitable instead, so no
+    binary interlock is needed and the program stays an LP.
 
 Objective
 =========
@@ -211,18 +223,24 @@ The exogenous Base Load also incurs cost, but it is a constant offset
 independent of the decision variables, so it is folded into the reported
 ``expected_cost`` afterwards rather than into the objective.
 
-When a battery is present, two further terms are added::
+When a battery is present, three further terms are added::
 
     + κ · Σ_t π[t] · (p_chg[t] − p_dis[t])    — battery net grid cost
     − λ · soc[T]                              — terminal value of stored energy
+    + κ · Σ_t ε[t] · (p_chg[t] + p_dis[t])    — throughput cost
 
 Charging draws from the grid (a cost) while discharging offsets load that
 would otherwise be imported (a saving), so the optimiser is rewarded for
 shifting discharge into expensive slots. The terminal reward, with
-``λ = (min_t π[t] / 1000) · η_d``, prices the energy still stored at the end
-of the horizon at roughly its cheapest acquisition cost — preventing the
-optimiser from dumping the pack at the horizon edge or refusing to charge
-because the payoff falls beyond ``T`` (ADR 0002).
+``λ = (max(min_t π[t], 0) / 1000) · η_d``, prices the energy still stored at
+the end of the horizon at roughly its cheapest acquisition cost, and never
+below zero (ADR 0002). The throughput cost
+``ε[t] = k · max(0, −min_{s≥t} π[s])`` with
+``k = (1 − η_c·η_d) / (2·η_c·η_d)``, plus a tie-break ``ε₀ = 0.01`` per MWh
+when ``λ = 0``, keeps the battery from charging and discharging in the same
+slot (C7; see :func:`_battery_throughput_price`). It is not money: like the
+terminal reward and the slack penalty it is backed out of the reported
+``expected_cost``.
 
 Every controlled load strictly *needs* to deliver its energy (EV deadline,
 heater windows, pending cycles via C6), so the optimiser will always start
@@ -234,14 +252,17 @@ Solver chain and fallback
 CVXPY is used to express the program. Solvers are tried in the order
 ``HIGHS → ECOS → SCIPY`` for pure-LP problems (no pending cycles), and
 ``HIGHS → GLPK_MI`` for mixed-integer problems. ECOS and SCIPY's linprog
-are LP-only and cannot solve the MIP form. If all candidate solvers fail
-or return a non-optimal status, :func:`solve_receding_horizon` returns a
-deterministic fallback schedule that:
+are LP-only and cannot solve the MIP form. A solver that raises or returns
+a non-optimal status hands over to the next one. If every candidate fails,
+:func:`solve_receding_horizon` returns a deterministic fallback schedule
+that:
 
 * charges the EV ASAP at rated power inside the availability window until
   ``remaining_ev_kwh`` is satisfied or the horizon ends,
 * runs the heater at rated power inside each deadline window until the
   required kWh is delivered,
+* cuts both back where they would push the load over the house cap (C5),
+  on top of Base Load, committed cycles and pending cycles run now,
 * places each pending cycle at its ``earliest_start_slot`` (i.e. "run now"), and
 * idles the battery (``p_chg = p_dis = 0``, SoC held at ``initial_soc_kwh``).
 
@@ -310,6 +331,36 @@ _PER_SLOT_FACTOR = _SLOT_HOURS / 1000.0
 # feasible. With horizon costs typically below O(10)$ at 24 h and slack
 # measured in kWh, ρ = 1000 leaves a comfortable margin.
 _SLACK_PENALTY = 1000.0
+
+# Tie-break cost ε₀ on battery throughput (currency/MWh charged or discharged),
+# used only when the terminal reward λ is zero. Breaks the tie between
+# charging and discharging in the same slot and doing neither when stored
+# energy is worth nothing; far too small to change any real dispatch decision
+# (0.001 ct/kWh).
+_BATTERY_THROUGHPUT_TIE_BREAK = 0.01
+
+
+def _battery_throughput_price(prices: np.ndarray, battery_spec: BatterySpec) -> np.ndarray:
+    """Per-slot cost ε[t] on battery throughput ``p_chg[t] + p_dis[t]`` (currency/MWh).
+
+    Charging and discharging in the same slot wastes energy through the
+    round-trip loss ``1 − η_c·η_d``. Only negative prices can make that waste
+    pay: in a negative slot it raises paid import, and before one it empties
+    the pack to make room. Pricing throughput at
+    ``ε[t] = k · max(0, −min_{s≥t} π[s])`` with
+    ``k = (1 − η_c·η_d) / (2·η_c·η_d)`` makes both unprofitable, so the LP
+    never does it and stays an LP (no binary interlock). Charging in the most
+    negative slot stays profitable, since ``k < 1``.
+
+    When every price is positive the terminal reward λ > 0 already makes the
+    waste a strict loss. When the cheapest price is zero or below, λ = 0 and
+    the waste can be a tie, so the tie-break ``ε₀`` is added to every slot.
+    """
+    rt = battery_spec.eta_charge * battery_spec.eta_discharge
+    future_min = np.minimum.accumulate(prices[::-1])[::-1]
+    k = (1.0 - rt) / (2.0 * rt)
+    tie_break = _BATTERY_THROUGHPUT_TIE_BREAK if prices.min() <= 0.0 else 0.0
+    return tie_break + k * np.maximum(-future_min, 0.0)
 
 
 def _floor_slot(now: datetime) -> datetime:
@@ -440,6 +491,33 @@ def _heater_window_slot_masks(
     return masks
 
 
+def _heater_window_iterations(
+    slot0: datetime,
+    horizon_slots: int,
+    deadlines: tuple[HeaterEnergyDeadline, ...] = HEATER_DEADLINES,
+) -> dict[tuple[int, int], np.ndarray]:
+    """Slot masks keyed by ``(deadline_hour, iteration)`` for every heater window in view.
+
+    Iteration 0 is the window currently in progress (the same slots as
+    :func:`_heater_window_slot_masks`); iteration ``k`` is the ``k``-th later
+    occurrence of that window inside the horizon.
+    """
+    if not deadlines:
+        return {}
+    hours = sorted(d.hour for d in deadlines)
+    seen = {h: 0 for h in hours}
+    masks: dict[tuple[int, int], np.ndarray] = {}
+    for t in range(horizon_slots):
+        slot_t = slot0 + timedelta(minutes=SLOT_MINUTES * t)
+        if slot_t.minute == 0 and slot_t.hour in seen:
+            seen[slot_t.hour] += 1
+        slot_minutes = slot_t.hour * 60 + slot_t.minute
+        h_star = min(hours, key=lambda h: ((h * 60 - slot_minutes) % 1440) or 1440)
+        key = (h_star, seen[h_star])
+        masks.setdefault(key, np.zeros(horizon_slots, dtype=bool))[t] = True
+    return masks
+
+
 def solve_receding_horizon(
     now: datetime,
     prices: np.ndarray,
@@ -519,7 +597,7 @@ def solve_receding_horizon(
             function output is identical to the pre-battery behaviour.
             When supplied, three decision variables ``p_chg[t]``,
             ``p_dis[t]``, and ``soc[t]`` are added to the LP (no binary
-            variables — round-trip losses alone deter simultaneous
+            variables — a throughput cost deters simultaneous
             charge/discharge, keeping the program a pure LP).
         initial_soc_kwh: State-of-charge at the start of the horizon (kWh).
             Defaults to 0 (battery starts empty).  Maintained across
@@ -666,36 +744,62 @@ def solve_receding_horizon(
                 >= remaining_ev_kwh
             )
         else:
-            required_this_horizon = max(
+            # Never more than the car still needs (the C2 upper limit, 4b).
+            required_this_horizon = min(remaining_ev_kwh, max(
                 0.0,
                 remaining_ev_kwh
                 * (horizon_h / max(time_to_deadline_h, 1e-6))
                 * deadline_safety,
-            )
+            ))
             constraints.append(
                 cp.sum(p_ev) * _SLOT_HOURS + slack_ev >= required_this_horizon
             )
 
     # --- 4. C3: heater energy per deadline window --------------------------- #
-    # Only constrain windows whose deadline lies within the horizon AND for
-    # which the window actually overlaps the horizon. For deadlines fully
-    # outside, we apply a proportional pre-charge (same logic as the EV's
-    # outside-horizon regime) so the heater starts contributing early on
-    # long-horizon (24 h) plans where the next overnight deadline may be
-    # 25 h away after a 18:00 reset.
+    # Only constrain windows whose current iteration overlaps the horizon.
+    # A window with no slot in the horizon gets no constraint at all (there
+    # is no proportional pre-charge as for the EV); a later replan picks it
+    # up once its slots come into view.
     for d in heater_deadlines:
         kwh_required = float(remaining_heater_kwh_by_window.get(d.hour, d.kwh_required))
         if kwh_required <= 1e-6:
             continue
         window_mask = heater_masks.get(d.hour)
         if window_mask is None or not window_mask.any():
-            # Window is entirely outside the horizon — proportional regime.
+            # Window is entirely outside the horizon — no constraint.
             continue
         # Energy delivered in window-slots inside the horizon ≥ kwh_required − slack.
         constraints.append(
             cp.sum(cp.multiply(p_heat, window_mask.astype(float))) * _SLOT_HOURS
             + slack_heat[d.hour]
             >= kwh_required
+        )
+
+    # --- 4b. Physical upper energy limits ----------------------------------- #
+    # The EV and the heater cannot absorb more than they need: the car takes
+    # at most its remaining kWh before the deadline (and at most one daily
+    # need in the next window), and each heater window at most the kWh it
+    # still owes (a later iteration at most its configured requirement).
+    # Without these a negative price makes the plan buy energy with nowhere
+    # to put it.
+    constraints.append(
+        cp.sum(p_ev[:deadline_slot]) * _SLOT_HOURS <= max(remaining_ev_kwh, 0.0)
+    )
+    if deadline_slot < horizon_slots:
+        constraints.append(
+            cp.sum(p_ev[deadline_slot:]) * _SLOT_HOURS <= EV_DAILY_NEED_KWH
+        )
+    heater_cap_kwh = {d.hour: float(d.kwh_required) for d in heater_deadlines}
+    for (h, k), mask in _heater_window_iterations(
+        slot0, horizon_slots, heater_deadlines,
+    ).items():
+        cap_kwh = (
+            float(remaining_heater_kwh_by_window.get(h, heater_cap_kwh[h]))
+            if k == 0 else heater_cap_kwh[h]
+        )
+        constraints.append(
+            cp.sum(cp.multiply(p_heat, mask.astype(float))) * _SLOT_HOURS
+            <= max(cap_kwh, 0.0)
         )
 
     # --- 5. C5: house power cap at every slot ------------------------------- #
@@ -779,24 +883,31 @@ def solve_receding_horizon(
     # and the expected_cost back-out (section 8b). Avoids drift between the two.
     min_price: float = float(prices.min()) if prices.size else 0.0
     lambda_val: float = (
-        (min_price / 1000.0) * battery_spec.eta_discharge
+        (max(min_price, 0.0) / 1000.0) * battery_spec.eta_discharge
         if battery_spec is not None
         else 0.0
     )
 
     # Value-of-stored-energy terminal reward (ADR 0002): reward leftover SoC at
-    # horizon end at its cheapest acquisition cost × η_d.  This prevents both
-    # edge-dumping (battery drains before T) and myopic under-charging (battery
-    # refuses to charge because the horizon ends before the payoff slot).
-    #   λ = (min(π) / 1000) × η_d   [$/kWh delivered]
+    # horizon end at its cheapest acquisition cost × η_d, floored at zero so a
+    # negative price never makes stored energy a liability.
+    #   λ = (max(min(π), 0) / 1000) × η_d   [$/kWh delivered]
     # Adding -λ·soc[T] to a minimisation objective rewards storing energy.
     terminal_reward: cp.Expression | float = 0.0
     if battery_spec is not None:
         terminal_reward = -lambda_val * soc[horizon_slots]
 
+    throughput_term: cp.Expression | float = 0.0
+    if battery_spec is not None:
+        throughput_price = _battery_throughput_price(prices, battery_spec)
+        throughput_term = (
+            cp.sum(cp.multiply(throughput_price, p_chg + p_dis)) * _PER_SLOT_FACTOR
+        )
+
     slack_term = _SLACK_PENALTY * (slack_ev + sum(slack_heat.values()))
     obj = cp.Minimize(
         actual_cost + battery_net_cost + pending_cost + slack_term + terminal_reward
+        + throughput_term
     )
     prob = cp.Problem(obj, constraints)
 
@@ -818,7 +929,12 @@ def solve_receding_horizon(
                 solver, status,
                 f"{prob.value:.4f}" if prob.value is not None else "None",
             )
-            break
+            if prob.value is not None and status in ("optimal", "optimal_inaccurate"):
+                break
+            logger.warning(
+                "solve_receding_horizon: solver=%s returned status=%s — trying next",
+                solver, status,
+            )
         except cp.SolverError:
             logger.warning(
                 "solve_receding_horizon: solver=%s raised SolverError — trying next", solver,
@@ -856,9 +972,22 @@ def solve_receding_horizon(
             "solve_receding_horizon: no optimal solution (status=%s) — using ASAP fallback",
             status,
         )
-        ev_plan = _fallback_ev_plan(remaining_ev_kwh, ev_mask, ev_spec.rated_kw, horizon_slots)
+        # Headroom under the house cap left by the loads the fallback cannot
+        # move: Base Load, committed cycles and pending cycles run now.
+        fixed_kw = _base_load.copy()
+        for task in committed_list:
+            fixed_kw[task.start_slot:task.start_slot + task.slots] += (
+                appliances[task.appliance].rated_kw
+            )
+        for pc in pending_list:
+            fixed_kw[pc.earliest_start_slot:pc.earliest_start_slot + pc.cycle_slots] += pc.rated_kw
+        headroom_kw = np.maximum(house_cap_kw - fixed_kw, 0.0)
+        ev_plan = _fallback_ev_plan(
+            remaining_ev_kwh, ev_mask, ev_spec.rated_kw, horizon_slots, headroom_kw,
+        )
         heater_plan, window_kwh = _fallback_heater_plan(
             remaining_heater_kwh_by_window, heater_masks, heater_spec.rated_kw, horizon_slots,
+            headroom_kw - ev_plan,
         )
         # Fallback for pending cycles: place each one at its earliest
         # allowed start (i.e. "run now"). The schedule still tracks them
@@ -934,18 +1063,20 @@ def solve_receding_horizon(
     )
 
     # expected_cost = objective − slack_penalty_term − terminal_reward_term
-    #               + committed_cost + base_load_cost
+    #               − throughput_term + committed_cost + base_load_cost
     # The terminal reward is a negative term in the minimisation objective; we subtract it
     # back out so expected_cost reflects real net grid expenditure (not negative energy profit).
     # Base-Load cost is added here and to baseline_cost so the savings ratio measures money
     # off the *total* bill — the only thing a Home Battery exists to reduce (ADR 0003).
     terminal_reward_val = 0.0
+    throughput_val = 0.0
     if battery_spec is not None and soc is not None:
         terminal_reward_val = -lambda_val * float(soc.value[horizon_slots])
+        throughput_val = float(throughput_term.value)
     base_load_cost = float((_base_load * prices).sum() * _PER_SLOT_FACTOR)
     sched.expected_cost = float(prob.value - _SLACK_PENALTY * (
         float(slack_ev.value or 0.0) + sum(float(s.value or 0.0) for s in slack_heat.values())
-    ) - terminal_reward_val + committed_cost + base_load_cost)
+    ) - terminal_reward_val - throughput_val + committed_cost + base_load_cost)
     sched.baseline_cost = _baseline_cost(
         prices, remaining_ev_kwh, remaining_heater_kwh_by_window,
         ev_mask, heater_masks, ev_spec.rated_kw, heater_spec.rated_kw,
@@ -968,8 +1099,13 @@ def _fallback_ev_plan(
     ev_mask: np.ndarray,
     rated_kw: float,
     horizon_slots: int,
+    headroom_kw: np.ndarray | None = None,
 ) -> np.ndarray:
-    """ASAP charge inside the EV availability window until the kWh need is met."""
+    """ASAP charge inside the EV availability window until the kWh need is met.
+
+    With ``headroom_kw`` the charge in each slot also stays within the power
+    left under the house cap.
+    """
     p = np.zeros(horizon_slots)
     remaining = remaining_ev_kwh
     for t in range(horizon_slots):
@@ -977,7 +1113,8 @@ def _fallback_ev_plan(
             break
         if not ev_mask[t]:
             continue
-        add = min(rated_kw, remaining / _SLOT_HOURS)
+        limit = rated_kw if headroom_kw is None else min(rated_kw, headroom_kw[t])
+        add = min(limit, remaining / _SLOT_HOURS)
         p[t] = add
         remaining -= add * _SLOT_HOURS
     return p
@@ -988,8 +1125,13 @@ def _fallback_heater_plan(
     window_masks: dict[int, np.ndarray],
     rated_kw: float,
     horizon_slots: int,
+    headroom_kw: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[int, float]]:
-    """ASAP heater run inside each window until that window's kWh is met."""
+    """ASAP heater run inside each window until that window's kWh is met.
+
+    With ``headroom_kw`` the heater in each slot also stays within the power
+    left under the house cap.
+    """
     p = np.zeros(horizon_slots)
     delivered: dict[int, float] = {}
     for h, mask in window_masks.items():
@@ -1002,7 +1144,8 @@ def _fallback_heater_plan(
                 break
             # Keep room under the rated_kw cap if a previous window already
             # requested power in this slot (unusual but possible at boundary).
-            avail = max(0.0, rated_kw - p[t])
+            limit = rated_kw if headroom_kw is None else min(rated_kw, headroom_kw[t])
+            avail = max(0.0, limit - p[t])
             add = min(avail, need / _SLOT_HOURS)
             p[t] += add
             need -= add * _SLOT_HOURS

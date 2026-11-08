@@ -278,3 +278,44 @@ def test_replannable_onset_keeps_original_onset_time():
     )
     (re_offered,) = c.replannable_onsets(later)
     assert re_offered.timestamp == onset
+
+
+# --------------------------------------------------------------------------- #
+# Applied power: what actually flowed, for billing                             #
+# --------------------------------------------------------------------------- #
+_T = datetime(2026, 4, 15, 21, 0, tzinfo=timezone.utc)
+
+
+def test_applied_ev_and_heater_power_stop_once_the_need_is_met():
+    c = CommitTracker(remaining_ev_kwh=0.5, remaining_heater_kwh_by_window={7: 0.25, 18: 0.0})
+    c.ev_power_setpoint_kw = 7.0
+    c.heater_power_setpoint_kw = 2.0
+    c.tick(_T, dt_s=900.0)
+    # 15 min at 7 kW would be 1.75 kWh; the car only takes 0.5 kWh.
+    assert c.ev_power_applied_kw * 0.25 == pytest.approx(0.5)
+    assert c.heater_power_applied_kw * 0.25 == pytest.approx(0.25)
+    c.tick(_T + timedelta(minutes=15), dt_s=1.0)
+    assert c.ev_power_applied_kw == 0.0 and c.heater_power_applied_kw == 0.0
+
+
+def test_applied_battery_charge_stops_when_full_and_discharge_when_empty():
+    batt = BatterySpec(capacity_kwh=1.0)
+    c = CommitTracker(battery_spec=batt, soc_kwh=0.95)
+    c.battery_charge_setpoint_kw = 4.0
+    c.tick(_T, dt_s=900.0)
+    assert batt.eta_charge * c.battery_charge_applied_kw * 0.25 == pytest.approx(0.05)
+    c.battery_charge_setpoint_kw = 0.0
+    c.battery_discharge_setpoint_kw = 4.0
+    c.soc_kwh = 0.1
+    c.tick(_T + timedelta(minutes=15), dt_s=900.0, offsettable_load_kw=10.0)
+    assert c.battery_discharge_applied_kw * 0.25 / batt.eta_discharge == pytest.approx(0.1)
+    assert c.soc_kwh == pytest.approx(0.0)
+
+
+def test_full_ev_setpoint_is_not_offsettable_by_the_battery():
+    """A full EV draws nothing, so the battery cannot discharge into its setpoint."""
+    c = CommitTracker(remaining_ev_kwh=0.0, battery_spec=BatterySpec(), soc_kwh=5.0)
+    c.ev_power_setpoint_kw = 7.0
+    c.battery_discharge_setpoint_kw = 5.0
+    c.tick(_T, dt_s=1.0, offsettable_load_kw=7.0 + 0.5)
+    assert c.battery_discharge_applied_kw == pytest.approx(0.5)

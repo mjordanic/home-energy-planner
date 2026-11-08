@@ -22,9 +22,10 @@ Per simulation tick the orchestrator:
    strategy still has the same appliance pending or running, preventing
    the "phantom second cycle" effect when two strategies disagree on the
    length of a cycle,
-3. ticks every strategy with the same ``(sample, gated_onsets)`` pair,
-4. at every 15-min slot boundary, asks each strategy for a SlotRecord and
-   merges them into a wide row (column-prefixed by ``strategy.name``),
+3. at every 15-min slot boundary, asks each strategy for a SlotRecord of
+   the slot that just ended (billed from the energy accrued every second)
+   and merges them into a wide row (column-prefixed by ``strategy.name``),
+4. ticks every strategy with the same ``(sample, gated_onsets)`` pair,
 5. flushes events from each strategy into a single per-decision event log.
 
 Outputs
@@ -149,6 +150,17 @@ def run(
     last_realized_price: float | None = None
     n_samples = 0
     n_suppressed_total = 0
+    # The slot being accrued: its row is written once it has ended, so every
+    # strategy bills the energy that flowed over the whole slot.
+    open_row: dict | None = None
+
+    def close_slot(row: dict) -> None:
+        for s in strategies:
+            rec = s.get_slot_record(row["timestamp"], row["price_eur_mwh"])
+            row.update(rec.to_flat_dict(prefix=s.name))
+        row["onsets"] = ",".join(sorted(row["onsets"]))
+        row["suppressed_onsets"] = ",".join(sorted(row["suppressed_onsets"]))
+        slot_rows.append(row)
 
     duration_h = (end - start).total_seconds() / 3600.0
     logger.info(
@@ -187,25 +199,25 @@ def run(
                 detail=f"blocked_by=[{','.join(blockers)}]",
             ))
 
-        # 4. Tick every strategy with the same (sample, gated onsets).
-        for s in strategies:
-            s.tick(sample, permitted, dt_s=1.0)
-
-        # 5. Slot boundary: collect a SlotRecord from every strategy.
+        # 4. Slot boundary: close the slot that just ended (a SlotRecord from
+        #    every strategy) and open the new one before this second accrues.
         if sample.realized_price is not None:
             last_realized_price = sample.realized_price
-            row: dict = {
+            if open_row is not None:
+                close_slot(open_row)
+            open_row = {
                 "timestamp": sample.t,
                 "price_eur_mwh": sample.realized_price,
-                "onsets": ",".join(sorted({o.appliance for o in permitted})),
-                "suppressed_onsets": ",".join(
-                    sorted({o.appliance for o, _ in suppressed})
-                ),
+                "onsets": set(),
+                "suppressed_onsets": set(),
             }
-            for s in strategies:
-                rec = s.get_slot_record(sample.t, sample.realized_price)
-                row.update(rec.to_flat_dict(prefix=s.name))
-            slot_rows.append(row)
+        if open_row is not None:
+            open_row["onsets"].update(o.appliance for o in permitted)
+            open_row["suppressed_onsets"].update(o.appliance for o, _ in suppressed)
+
+        # 5. Tick every strategy with the same (sample, gated onsets).
+        for s in strategies:
+            s.tick(sample, permitted, dt_s=1.0)
 
         # 6. Flush each strategy's pending events into the shared event log.
         for s in strategies:
@@ -220,6 +232,12 @@ def run(
                 "digital_twin status [%s] samples=%d suppressed=%d  %s",
                 sample.t.isoformat(), n_samples, n_suppressed_total, cost_str,
             )
+
+    # The last slot ends with the stream.
+    if open_row is not None:
+        close_slot(open_row)
+        for s in strategies:
+            event_rows.extend(s.flush_events(price_eur_mwh=last_realized_price))
 
     # Cleanup hooks (e.g. close OptimizerStrategy's JSONL).
     for s in strategies:

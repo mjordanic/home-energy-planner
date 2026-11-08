@@ -262,3 +262,75 @@ def test_accepted_cycle_runs_within_its_original_window_across_replans():
     commits = [e for e in events
                if e["event_type"] == "cycle_committed" and e["appliance"] == "dishwasher"]
     assert len(commits) <= 3, f"{len(commits)} cycle_committed events for one cycle"
+
+
+# --------------------------------------------------------------------------- #
+# Deadline-slip storm and per-second billing                                   #
+# --------------------------------------------------------------------------- #
+def test_deferred_ev_plan_does_not_storm_deadline_slip_and_bills_close(tmp_path: Path):
+    """20:00 → 22:30 on a cheap-night feed: the optimizers defer EV charging
+    into the cheap night, which is the plan and must not re-plan every 30 s
+    cooldown.
+
+    Setpoints change mid-slot (the baseline EV fills at 21:25:43, a washing
+    machine starts at 20:05), so the bills must come from energy accrued
+    every second: billed EV energy equals what the counters delivered and
+    the battery's billed charge/discharge equals its change of charge.
+    """
+    start = datetime(2024, 12, 16, 20, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=2, minutes=30)
+    feed = _DayNightPriceFeed(start, end)
+    streamer = Streamer(realized_price_provider=feed.realized)
+    streamer.add_onset("washing_machine", start + timedelta(minutes=5))
+
+    baseline = BaselineStrategy(name="baseline")
+    baseline.remaining_ev_kwh = 10.0
+    optimizers = [
+        OptimizerStrategy(
+            name=f"optimizer_{tag}",
+            price_history_provider=feed.history,
+            price_oracle_impl="naive",
+            auto_confirm=True,
+            battery_enabled=batt,
+        )
+        for tag, batt in (("nobatt", False), ("batt", True))
+    ]
+    optimizers[1].commit.soc_kwh = 5.0
+
+    run(
+        strategies=[baseline, *optimizers],
+        streamer=streamer,
+        start=start,
+        end=end,
+        slot_log_path=tmp_path / "slot_log.parquet",
+        event_log_path=tmp_path / "event_log.parquet",
+    )
+    slot_df = pd.read_parquet(tmp_path / "slot_log.parquet")
+    event_df = pd.read_parquet(tmp_path / "event_log.parquet")
+
+    replans = event_df[event_df["event_type"] == "replan_triggered"]
+    for opt in optimizers:
+        slips = replans[
+            (replans["strategy"] == opt.name)
+            & replans["detail"].str.contains("kind=deadline_slip")
+        ]
+        # At most the very first plan (no plan yet to compare against) and a
+        # catch-up or two when the plan's charging starts.
+        assert len(slips) <= 3, f"{opt.name}: {len(slips)} deadline-slip re-plans"
+
+    slot_h = 0.25
+    assert (slot_df["baseline_ev_kw"].sum() * slot_h
+            == pytest.approx(10.0 - baseline.remaining_ev_kwh, abs=1e-9))
+    assert baseline.remaining_ev_kwh == 0.0
+    for opt in optimizers:
+        billed = slot_df[f"{opt.name}_ev_kw"].sum() * slot_h
+        assert billed == pytest.approx(24.0 - opt.commit.remaining_ev_kwh, abs=1e-9)
+    spec = BatterySpec()
+    books = (
+        spec.eta_charge * slot_df["optimizer_batt_battery_charge_kw"]
+        - slot_df["optimizer_batt_battery_discharge_kw"] / spec.eta_discharge
+    ).sum() * slot_h
+    assert books == pytest.approx(optimizers[1].commit.soc_kwh - 5.0, abs=1e-9)
+    # The washing machine ran its full 1.5 h cycle for every strategy.
+    for name in ("baseline", *(o.name for o in optimizers)):
+        assert slot_df[f"{name}_cycle_kw"].sum() * slot_h == pytest.approx(2.4 * 1.5, abs=1e-9)

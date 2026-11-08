@@ -591,8 +591,9 @@ MD_J = """\
 
 We solve the same 24 h day with horizons of **6 h, 12 h, and 24 h**, all
 evaluated at midnight. A short horizon cannot see the next deadline far
-ahead, so it relies on the proportional-EV and proportional-heater
-fallbacks; a long horizon sees both deadlines and can plan globally.
+ahead, so it relies on the proportional EV share, and a heater window with
+no slot in view is not constrained at all; a long horizon sees both deadlines
+and can plan globally.
 
 We report:
 - expected cost
@@ -653,9 +654,10 @@ MD_K = """\
 ## Scenario K — Heater infeasibility → soft slack
 
 We override `HEATER_DEADLINES` with a deliberately impossible spec:
-**100 kWh required by 07:00**. The heater rated power is 2 kW so the
-maximum it can deliver in any 13 h overnight window is 26 kWh — slack must
-absorb the rest. The LP must remain feasible (`status="optimal"`) because
+**100 kWh required by 07:00**. The heater rated power is 2 kW and the
+horizon starts at 00:00, so only the 7 h from 00:00 to 07:00 of the overnight
+window are in view: at most 14 kWh can be delivered — slack must absorb the
+rest. The LP must remain feasible (`status="optimal"`) because
 the slack penalty is dominated only by the cost we *cannot* shave.
 """
 
@@ -673,7 +675,7 @@ sched_K = solve_receding_horizon(
 )
 heat = np.asarray(sched_K.heater_power_kw)
 print(f"Heater max power across horizon: {heat.max():.3f} kW  (rated 2.0)")
-print(f"Window 07:00 delivered: {sched_K.heater_window_kwh[7]:.3f} kWh  (asked 100; physical max ≤ 26)")
+print(f"Window 07:00 delivered: {sched_K.heater_window_kwh[7]:.3f} kWh  (asked 100; physical max 14 = 2 kW × 7 h in view)")
 print(f"Solver status: {sched_K.solver_status}")
 assert sched_K.solver_status in ("optimal", "optimal_inaccurate")
 
@@ -1143,7 +1145,7 @@ MD_SUMMARY = """\
 | E | Power-cap binding (C5) | EV + heater share the 8 kW cap |
 | F | Committed dishwasher (C5 + headroom) | EV + heater throttle during the cycle |
 | I | HITL throughput stress | 8 onsets, mixed accept/decline, threshold filters spurious offers |
-| J | Horizon sensitivity | 24 h LP is only ~3× slower than 6 h, savings improve with horizon |
+| J | Horizon sensitivity | 24 h LP is only a few times slower than 6 h; savings % are not comparable across horizons (the 6 h plan does not reach the 18:00 heater window) |
 | K | Heater infeasibility | Slack absorbs the impossible 100 kWh ask, LP stays optimal |
 | L | Joint MIP vs price-only reschedule | Joint solve avoids cap-induced re-shuffle, lowers plan cost |
 | M | Re-nudge before start | Deferred dishwasher is replanned after new onset (moves again) |
